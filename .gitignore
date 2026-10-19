@@ -1,0 +1,34 @@
+# Build outputs
+/dist/
+/web/dist/
+
+# Dependencies
+/web/node_modules/
+
+# Tool caches and local temp
+/.cache/
+*.log
+
+# Runtime / local dev data (installed paths, not source)
+/data/
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal
+
+# Go test and coverage artifacts
+*.test
+coverage.out
+coverage.html
+
+# OS and editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local env overrides (tracked examples stay under configs/)
+.env
+!.env.example

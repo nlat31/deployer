@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Build from source; package only an explicit role-specific allowlist.
+set -euo pipefail
+umask 077
+cd -- "$(dirname -- "$0")/.."
+role="${1:-}"
+version="${2:-}"
+arch="${GOARCH:-amd64}"
+[[ "$role" == server || "$role" == agent ]] || exit 2
+[[ "$version" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}$ && "$version" != . && "$version" != .. ]] || {
+  echo "Usage: ./release-$role.sh VERSION (GOARCH=amd64|arm64)" >&2; exit 2;
+}
+[[ "$arch" == amd64 || "$arch" == arm64 ]] || { echo 'Unsupported GOARCH' >&2; exit 2; }
+export GOCACHE="${GOCACHE:-$PWD/.cache/go-build}"
+if [[ "$role" == server ]]; then
+  npm --prefix web ci --no-audit --no-fund
+  npm --prefix web run build
+fi
+mkdir -p dist
+stage="$(mktemp -d "$PWD/dist/.release-$role-XXXXXX")"
+trap 'rm -rf -- "$stage"' EXIT
+name="deployer-$role-$version-linux-$arch"
+package="$stage/$name"
+mkdir -p "$package"
+binaries=("deployer-$role")
+for binary in "${binaries[@]}"; do
+  CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -buildvcs=false -trimpath -ldflags='-s -w' -o "$package/$binary" "./cmd/$binary"
+done
+python3 scripts/package-lifecycle.py "$role" "$arch" "$version" "$package"
+tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner -cf - -C "$stage" "$name" | gzip -n > "$stage/$name.tar.gz"
+mv -- "$stage/$name.tar.gz" "dist/$name.tar.gz"
+(cd dist; sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+printf 'Release: %s/dist/%s.tar.gz\n' "$PWD" "$name"
