@@ -2,6 +2,7 @@ package model
 
 import (
 	"crypto/rand"
+	"deployer/internal/selfupdate"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -114,14 +115,15 @@ type Manifest struct {
 	Health  *Health `yaml:"health,omitempty"`
 }
 type Node struct {
-	IP                 string `json:"ip"`
-	ID                 string `json:"id"`
-	Name               string `json:"name"`
-	OS                 string `json:"os"`
-	Arch               string `json:"arch"`
-	LastSeen           int64  `json:"last_seen"`
-	FreeBytes          uint64 `json:"free_bytes"`
-	CertificateExpires int64  `json:"certificate_expires"`
+	AgentUpdate        selfupdate.Status `json:"agent_update"`
+	IP                 string            `json:"ip"`
+	ID                 string            `json:"id"`
+	Name               string            `json:"name"`
+	OS                 string            `json:"os"`
+	Arch               string            `json:"arch"`
+	LastSeen           int64             `json:"last_seen"`
+	FreeBytes          uint64            `json:"free_bytes"`
+	CertificateExpires int64             `json:"certificate_expires"`
 }
 type Config struct {
 	ID           string            `json:"id"`
@@ -218,16 +220,19 @@ type OperationRequest struct {
 	Confirm          bool              `json:"confirm"`
 }
 type Poll struct {
-	Name          string          `json:"name"`
-	OS            string          `json:"os"`
-	Arch          string          `json:"arch"`
-	Protocol      int             `json:"protocol"`
-	Deployments   []Deployment    `json:"deployments"`
-	Installations []Installation  `json:"installations"`
-	Operations    []Operation     `json:"operations"`
-	Events        []Event         `json:"events"`
-	FreeBytes     uint64          `json:"free_bytes"`
-	Rejected      []TaskRejection `json:"rejected"`
+	AgentUpdate   selfupdate.Status `json:"agent_update"`
+	Draining      bool              `json:"draining"`
+	Trial         bool              `json:"trial"`
+	Name          string            `json:"name"`
+	OS            string            `json:"os"`
+	Arch          string            `json:"arch"`
+	Protocol      int               `json:"protocol"`
+	Deployments   []Deployment      `json:"deployments"`
+	Installations []Installation    `json:"installations"`
+	Operations    []Operation       `json:"operations"`
+	Events        []Event           `json:"events"`
+	FreeBytes     uint64            `json:"free_bytes"`
+	Rejected      []TaskRejection   `json:"rejected"`
 }
 type TaskRejection struct {
 	ID            string `json:"id"`
@@ -235,9 +240,10 @@ type TaskRejection struct {
 	LocalRevision int64  `json:"local_revision"`
 }
 type PollResponse struct {
-	Tasks        []Operation      `json:"tasks"`
-	Acknowledged []string         `json:"acknowledged"`
-	EventAcks    map[string]int64 `json:"event_acks"`
+	Update       *selfupdate.Manifest `json:"update,omitempty"`
+	Tasks        []Operation          `json:"tasks"`
+	Acknowledged []string             `json:"acknowledged"`
+	EventAcks    map[string]int64     `json:"event_acks"`
 }
 type User struct {
 	ID              string   `json:"id"`

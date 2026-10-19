@@ -61,7 +61,7 @@ certificate_dir = data / 'client-certificate'
 subprocess.run(['bash', str(root / 'scripts/pki.sh'), 'node', str(pki), node_id, str(certificate_dir)], check=True)
 log = (data / 'agent.log').open('w')
 agent = subprocess.Popen([str(root / 'dist/deployer-agent'), '--server', args.agent_server,
-                          '--data', str(data), '--direct-user', '--name', node_name,
+                          '--data', str(data), '--name', node_name,
                           '--ca', str(pki / 'ca.pem'), '--cert', str(certificate_dir / 'cert.pem'),
                           '--key', str(certificate_dir / 'key.pem')], stdout=log, stderr=log)
 node = None
@@ -104,12 +104,11 @@ try:
     with urllib.request.urlopen(f'http://127.0.0.1:{port}/') as response:
         assert json.load(response)['version'] == '1.0.0'
     # Exercise crash recovery through the real direct manager.
-    suffix = hashlib.sha256(f'{data}/sample-app/1.0.0'.encode()).hexdigest()[:24]
-    unit = f'deployer-{suffix}.service'
     def main_pid():
-        return subprocess.check_output(['systemctl', '--user', 'show', unit, '--property=MainPID', '--value'], text=True).strip()
+        record = data / 'apps/sample-app/versions/1.0.0/run/process.json'
+        return str(json.loads(record.read_text())['pid'])
     old_pid = main_pid()
-    subprocess.run(['systemctl', '--user', 'kill', '--kill-who=main', '--signal=SIGKILL', unit], check=True)
+    os.kill(int(old_pid), 9)
     wait_for(lambda: main_pid() not in ('0', old_pid) and deployment().get('run_state') == 'running')
     print('crash: automatically recovered', flush=True)
     results.append({'action': 'crash_recovery', 'result': 'succeeded'})
@@ -149,8 +148,5 @@ finally:
     except subprocess.TimeoutExpired:
         agent.kill()
         agent.wait()
-    for version in ('1.0.0', '1.1.0'):
-        suffix = hashlib.sha256(f'{data}/sample-app/{version}'.encode()).hexdigest()[:24]
-        subprocess.run(['systemctl', '--user', 'stop', f'deployer-{suffix}.service'],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+    subprocess.run([str(root / 'dist/deployer-agent'), '--stop-apps', '--data', str(data)], check=True)
     log.close()

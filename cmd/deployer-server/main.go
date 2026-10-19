@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"deployer/internal/selfupdate"
+	"encoding/json"
 	"errors"
 	"flag"
 	"log"
@@ -9,15 +11,18 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
 	"deployer/internal/controller"
+	"deployer/internal/launcher"
 	"deployer/web"
 )
 
 func main() {
+	version := flag.Bool("version", false, "print build metadata")
 	addr := flag.String("listen", env("DEPLOYER_LISTEN", "127.0.0.1:7710"), "HTTP(S) 监听地址")
 	data := flag.String("data", env("DEPLOYER_DATA", "./data/server"), "独立数据目录")
 	cert := flag.String("tls-cert", os.Getenv("DEPLOYER_TLS_CERT"), "TLS 证书路径")
@@ -25,6 +30,13 @@ func main() {
 	clientCA := flag.String("client-ca", os.Getenv("DEPLOYER_CLIENT_CA"), "信任的 Agent CA 证书（必需）")
 	uiAddr := flag.String("ui-listen", os.Getenv("DEPLOYER_UI_LISTEN"), "可选的回环 HTTP 页面监听地址")
 	flag.Parse()
+	if *version {
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]string{"version": selfupdate.Version, "commit": selfupdate.Commit, "os": runtime.GOOS, "arch": runtime.GOARCH, "compatibility": selfupdate.Compatibility})
+		return
+	}
+	if os.Geteuid() != 0 {
+		log.Fatal("deployer must run as root")
+	}
 	if _, _, err := net.SplitHostPort(*addr); err != nil {
 		log.Fatal(err)
 	}
@@ -47,6 +59,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer s.Close()
+	s.UpdatePublicKey = env("DEPLOYER_UPDATE_PUBLIC_KEY", "/data/deployer/config/update-public.key")
 	if err = s.ConfigureEnrollment(*clientCA); err != nil {
 		log.Fatal(err)
 	}
@@ -84,8 +97,27 @@ func main() {
 			_ = localUI.Shutdown(shutdown)
 		}
 	}()
+	listener, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if e := launcher.Pulse("ready"); e != nil {
+					log.Printf("readiness: %v", e)
+				}
+			}
+		}
+	}()
+
 	log.Printf("Deployer 控制端 %s 数据目录 %s", *addr, s.Root)
-	err = server.ListenAndServeTLS("", "")
+	err = server.ServeTLS(listener, "", "")
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}

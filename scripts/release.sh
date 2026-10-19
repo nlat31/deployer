@@ -22,10 +22,18 @@ trap 'rm -rf -- "$stage"' EXIT
 name="deployer-$role-$version-linux-$arch"
 package="$stage/$name"
 mkdir -p "$package"
-binaries=("deployer-$role")
+binaries=("deployer-$role" deployer-launcher)
+if [[ "$role" == server ]]; then binaries+=(deployerctl); fi
 for binary in "${binaries[@]}"; do
-  CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -buildvcs=false -trimpath -ldflags='-s -w' -o "$package/$binary" "./cmd/$binary"
+  flags="-s -w"
+  if [[ "$binary" != deployer-launcher ]]; then flags="$flags -X deployer/internal/selfupdate.Version=$version -X deployer/internal/selfupdate.Commit=$(git rev-parse --short HEAD)"; fi
+  CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -buildvcs=false -trimpath -ldflags="$flags" -o "$package/$binary" "./cmd/$binary"
 done
+if [[ "$role" == agent && -n "${DEPLOYER_UPDATE_SIGNING_KEY:-}" ]]; then
+  GOOS="$(go env GOHOSTOS)" GOARCH="$(go env GOHOSTARCH)" go run ./cmd/deployerctl sign-agent --key "$DEPLOYER_UPDATE_SIGNING_KEY" --version "$version" --arch "$arch" --binary "$package/deployer-agent" --out "$stage/manifest.json"
+  install -m 0600 "$stage/manifest.json" "dist/$name.manifest.json"
+  install -m 0700 "$package/deployer-agent" "dist/$name.bin"
+fi
 python3 scripts/package-lifecycle.py "$role" "$arch" "$version" "$package"
 tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner -cf - -C "$stage" "$name" | gzip -n > "$stage/$name.tar.gz"
 mv -- "$stage/$name.tar.gz" "dist/$name.tar.gz"

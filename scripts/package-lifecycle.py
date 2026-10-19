@@ -20,7 +20,7 @@ if pki:
     pki = Path(pki).resolve()
     if role == 'server':
         identity = pki / 'server'
-        cert_name, key_name, owner = 'server-cert.pem', 'server-key.pem', 'deployer-control'
+        cert_name, key_name, owner = 'server-cert.pem', 'server-key.pem', 'root'
         identities = [(cert_name, identity / 'cert.pem'), (key_name, identity / 'key.pem')]
     else:
         owner = 'root'
@@ -33,31 +33,23 @@ if pki:
         file_owner = 'root' if name == 'ca.pem' else owner
         mode = '0644' if name == 'ca.pem' else '0600'
         setup += f'''
-if [[ ! -e /data/deployer/config/{name} ]]; then
-  (umask 077; set -o noclobber; cat > /data/deployer/config/{name} <<'{delimiter}'
+if [[ ! -e "$root/config/{name}" ]]; then
+  (umask 077; set -o noclobber; cat > "$root/config/{name}" <<'{delimiter}'
 {pem}{delimiter}
   )
-  chown {file_owner}:{file_owner} /data/deployer/config/{name}
-  chmod {mode} /data/deployer/config/{name}
+  chown {file_owner}:{file_owner} "$root/config/{name}"
+  chmod {mode} "$root/config/{name}"
 fi
 '''
-common = header + '''[[ "$(id -u)" == 0 ]] || { echo 'Run this script as root (sudo).' >&2; exit 1; }
-unit="deployer-$role.service"
-'''
-start = common + '''[[ -f "/data/deployer/config/$role.env" && -x "/data/deployer/bin/deployer-$role" ]] || { echo 'Run setup.sh and configure certificates first.' >&2; exit 1; }
-systemctl enable "$unit"
-pid="$(systemctl show "$unit" --property=MainPID --value)"
-if systemctl is-active --quiet "$unit"; then
-  if [[ ! "/proc/$pid/exe" -ef "/data/deployer/bin/deployer-$role" ]]; then systemctl restart "$unit"; fi
-else
-  systemctl start "$unit"
-fi
-systemctl is-active "$unit"
-'''
-stop = common + '''if [[ "$(systemctl show "$unit" --property=LoadState --value)" != not-found ]]; then
-  systemctl stop "$unit"
-fi
-'''
+update_key = os.environ.get('DEPLOYER_UPDATE_PUBLIC_KEY')
+if update_key:
+    public = Path(update_key).read_text().strip()
+    import base64
+    assert len(base64.b64decode(public, validate=True)) == 32
+    setup += f'\nif [[ ! -e "$root/config/update-public.key" ]]; then\n  (umask 077; set -o noclobber; printf "%s\\n" "{public}" > "$root/config/update-public.key")\nfi\n'
+common = header + '\nroot="${DEPLOYER_ROOT:-/data/deployer}"\n'
+start = common + '\nexec "$root/bin/deployer-launcher" start --role "$role" --root "$root"\n'
+stop = common + '\n[[ "$(id -u)" == 0 ]] || exit 1\n[[ -e "$root" ]] || exit 0\nexec "$root/bin/deployer-launcher" stop --role "$role" --root "$root"\n'
 for name, text in [('setup.sh', setup), ('start.sh', start), ('stop.sh', stop), ('remove.sh', header + (root / 'scripts/remove-runtime.sh').read_text())]:
     path = destination / name
     path.write_text(text)

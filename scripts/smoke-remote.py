@@ -100,14 +100,14 @@ for version in ('1.0.0', '1.1.0'):
 record('upload and validate two versions')
 operation('deploy', '1.0.0', env={'PORT': '18877'}, health=health)
 assert app_version() == '1.0.0'
-suffix = hashlib.sha256(b'/data/deployer/agent/sample-app/1.0.0').hexdigest()[:24]
-unit = 'deployer-' + suffix + '.service'
-old_pid = ssh('sudo -n systemctl show ' + unit + ' --property=MainPID --value')
-ssh('sudo -n systemctl kill --kill-who=main --signal=SIGKILL ' + unit)
-wait(lambda: ssh('sudo -n systemctl show ' + unit + ' --property=MainPID --value') not in ('0', old_pid) and deployment()['run_state'] == 'running')
+def app_pid():
+    return str(json.loads(ssh('sudo -n cat /data/deployer/agent/apps/sample-app/versions/1.0.0/run/process.json'))['pid'])
+old_pid = app_pid()
+ssh('sudo -n kill -KILL ' + old_pid)
+wait(lambda: app_pid() != old_pid and deployment()['run_state'] == 'running')
 assert app_version() == '1.0.0'
 record('application crash recovery')
-ssh('sudo -n systemctl restart deployer-agent')
+ssh('sudo -n /data/deployer/lifecycle/agent/stop.sh && sudo -n /data/deployer/lifecycle/agent/start.sh')
 wait(lambda: any(n['id'] == a.node and n['last_seen'] > time.time()*1000-3000 for n in api('GET', '/snapshot')['nodes']))
 assert app_version() == '1.0.0'
 record('Agent restart preserves registration and application')
@@ -146,17 +146,17 @@ except urllib.error.HTTPError as error:
 record('active repository version deletion rejected')
 api('DELETE', '/apps/sample-app/versions/1.0.0?confirm=true')
 record('unused repository version deleted')
-ssh('sudo -n systemctl restart deployer-server')
+ssh('sudo -n /data/deployer/lifecycle/server/stop.sh && sudo -n /data/deployer/lifecycle/server/start.sh')
 time.sleep(3)
 csrf = api('POST', '/login', {'username': 'admin', 'password': os.environ['DEPLOYER_TEST_PASSWORD']})['csrf']
 assert deployment()['current'] == app_version() == '1.1.0'
 record('controller restart preserves state and running application')
-ssh('sudo -n systemctl stop deployer-agent')
+ssh('sudo -n /data/deployer/lifecycle/agent/stop.sh')
 try:
     wait(lambda: next(n for n in api('GET', '/snapshot')['nodes'] if n['id'] == a.node)['last_seen'] < time.time()*1000-32000, 45)
     record('offline node retained')
 finally:
-    ssh('sudo -n systemctl start deployer-agent')
+    ssh('sudo -n /data/deployer/lifecycle/agent/start.sh')
 wait(lambda: any(n['id'] == a.node and n['last_seen'] > time.time()*1000-3000 for n in api('GET', '/snapshot')['nodes']))
 operation('stop')
 operation('start')

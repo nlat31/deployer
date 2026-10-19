@@ -32,17 +32,18 @@ type Server struct {
 	enrollMinute int64
 	enrollCount  int
 
-	ClientCA     string
-	Root         string
-	DB           *store.Store
-	mux          *http.ServeMux
-	packagesMu   sync.RWMutex
-	loginMu      sync.Mutex
-	attempts     map[string][]int64
-	cookieSecure bool
-	batchMu      sync.Mutex
-	done         chan struct{}
-	workers      sync.WaitGroup
+	UpdatePublicKey string
+	ClientCA        string
+	Root            string
+	DB              *store.Store
+	mux             *http.ServeMux
+	packagesMu      sync.RWMutex
+	loginMu         sync.Mutex
+	attempts        map[string][]int64
+	cookieSecure    bool
+	batchMu         sync.Mutex
+	done            chan struct{}
+	workers         sync.WaitGroup
 }
 type apiError struct {
 	status  int
@@ -132,6 +133,10 @@ func New(root string, secure bool, ui http.Handler) (*Server, error) {
 	s.mux.HandleFunc("POST /api/users", s.authorize("admin", s.saveUser))
 	s.mux.HandleFunc("GET /api/users", s.authorize("admin", s.users))
 	s.mux.HandleFunc("POST /enroll", s.wrap(s.enroll))
+	s.mux.HandleFunc("POST /api/agent-releases", s.authorize("admin", s.uploadAgentRelease))
+	s.mux.HandleFunc("GET /api/agent-rollout", s.authorize("viewer", s.agentRollout))
+	s.mux.HandleFunc("POST /api/agent-rollout", s.authorize("admin", s.setAgentRollout))
+	s.mux.HandleFunc("GET /agent/releases/{digest}", s.agentAuth(s.downloadAgentRelease))
 	s.mux.HandleFunc("POST /agent/poll", s.agentAuth(s.poll))
 	s.mux.HandleFunc("GET /agent/packages/{digest}", s.agentAuth(s.download))
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -858,6 +863,9 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request) error {
 	if p.Protocol != model.Protocol {
 		return fail(409, "协议版本不一致")
 	}
+	if len(p.AgentUpdate.Version) > 96 || len(p.AgentUpdate.Digest) > 64 || len(p.AgentUpdate.Target) > 64 || len(p.AgentUpdate.Error) > 4096 || len(p.AgentUpdate.Phase) > 32 {
+		return fail(400, "更新状态超限")
+	}
 	if len(p.Events) > 200 || len(p.Operations) > 100 || len(p.Installations) > 10000 || len(p.Deployments) > 256 || len(p.Rejected) > 100 {
 		return fail(400, "状态批次超限")
 	}
@@ -890,6 +898,7 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request) error {
 		n.Arch = p.Arch
 		n.LastSeen = model.Now()
 		n.FreeBytes = p.FreeBytes
+		n.AgentUpdate = p.AgentUpdate
 		if err := store.Put(t, "nodes", n.ID, n); err != nil {
 			return err
 		}
@@ -1050,6 +1059,12 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request) error {
 			if e = store.TrimEvents(t, ev.OperationID, 2000); e != nil {
 				return e
 			}
+		}
+		if e := s.planAgentUpdate(t, n, p, &out); e != nil {
+			return e
+		}
+		if p.Draining || p.Trial {
+			return nil
 		}
 		ops, e := store.Query[model.Operation](t, "operations", store.Filter{Owner: n.ID, States: []string{"active"}, Asc: true})
 		if e != nil {

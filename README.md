@@ -13,7 +13,7 @@
 - 操作阶段和日志、应用进程文件日志、断线结果重传、重复任务去重、Agent 重启恢复和主机重启恢复。
 - 不确定状态阻止后续变更，可通过“停止并解除阻塞”核对并停止该 App 的所有本地版本。
 
-支持 Linux amd64/arm64、Bash 和 systemd 249 或更新版本。同一主机上的同一 App 同时运行一个版本；切换有短暂停机。应用数据按版本隔离，回退程序不会回滚外部数据库。业务进程异常退出或持续不健康时自动恢复，连续失败按 10 至 320 秒退避重试；主动停止后保持停止。
+支持 Linux amd64/arm64、Bash、flock 和 pidfd。控制端与 Agent 均以 root 运行，由独立 launcher 管理，无服务管理器依赖。同一主机上的同一 App 同时运行一个版本；切换有短暂停机。应用数据按版本隔离，回退程序不会回滚外部数据库。业务进程异常退出或持续不健康时自动恢复，连续失败按 10 至 320 秒退避重试；主动停止后保持停止。
 
 ## 构建
 
@@ -67,7 +67,7 @@ bash scripts/pki.sh node ./pki node-b
 ```bash
 sudo bash scripts/install.sh server
 sudoedit /data/deployer/config/server.env
-sudo systemctl enable deployer-server
+# setup 不启动；配置完成后执行 start.sh server
 ```
 
 在目标主机放置本项目的发行文件并安装 Agent：
@@ -75,7 +75,7 @@ sudo systemctl enable deployer-server
 ```bash
 sudo bash scripts/install.sh agent
 sudoedit /data/deployer/config/agent.env
-sudo systemctl enable deployer-agent
+# setup 不启动；配置完成后执行 start.sh agent
 ```
 
 控制端需要 `/data/deployer/config/server-cert.pem`、`server-key.pem` 和 `ca.pem`；`server.env` 配置对应路径。控制端服务账号需要能够读取服务端私钥：
@@ -83,16 +83,18 @@ sudo systemctl enable deployer-agent
 ```bash
 sudo install -m 0644 ./pki/server/cert.pem /data/deployer/config/server-cert.pem
 sudo install -m 0644 ./pki/ca.pem /data/deployer/config/ca.pem
-sudo install -m 0600 -o deployer-control -g deployer-control \
+sudo install -m 0600 -o root -g root \
   ./pki/server/key.pem /data/deployer/config/server-key.pem
-sudo systemctl start deployer-server
+sudo /data/deployer/lifecycle/server/start.sh
 ```
 
-目标主机需要信任服务端的 `ca.pem`；`client-cert.pem`、`client-key.pem` 缺失时首次启动自动生成和申请。配置 `agent.env` 的 `DEPLOYER_SERVER`、`DEPLOYER_CA`、`DEPLOYER_CLIENT_CERT`、`DEPLOYER_CLIENT_KEY`。Agent 私钥仅供 root 读取。证书和配置准备好后执行 `sudo systemctl start deployer-agent`，首次合法心跳自动保存主机信息，无需先在页面添加。
+目标主机需要信任服务端的 `ca.pem`；`client-cert.pem`、`client-key.pem` 缺失时首次启动自动生成和申请。配置 `agent.env` 的 `DEPLOYER_SERVER`、`DEPLOYER_CA`、`DEPLOYER_CLIENT_CERT`、`DEPLOYER_CLIENT_KEY`。Agent 私钥仅供 root 读取。证书和配置准备好后执行 `sudo /data/deployer/lifecycle/agent/start.sh`，首次合法心跳自动保存主机信息，无需先在页面添加。
 
 “主机列表”在 30 秒没有有效心跳后显示离线，离线记录不会自动删除。管理员可以删除离线主机；在线主机须先停止 Agent。删除只移除控制端主机、安装清单和部署记录，终止相关待执行任务及批次并保留审计，不能停止失联主机上的进程或删除业务数据。合法心跳再次到达时重新登记，已有本地部署进入待核对状态，执行“停止并解除阻塞”后继续管理。
 
-安装器创建专属账号、复制独立程序并写入 `deployer-server.service` 或 `deployer-agent.service`，不删除已有配置或业务数据。控制端以专用普通用户运行；Agent 以 root 直接执行应用四个脚本，不为应用创建 systemd 服务、不切换运行用户。只有控制端和 Agent 自身由 systemd 提供开机启动与崩溃重启。
+安装器幂等安装程序并保留配置和数据。控制端、Agent 与 launcher 均以 root 运行。使用发行包的 `setup.sh / start.sh / stop.sh / remove.sh` 管理，或安装目录 `lifecycle/{agent,server}/` 下的启停入口。stop 保留业务进程，remove 先停止业务再移除部署，保留配置、证书、数据库和业务数据。launcher 崩溃或主机重启后需重新执行 start。
+
+Agent 支持管理员指定签名版本、逐台自动更新、60 秒试运行验证和失败回退；主机列表显示版本及更新结果。发布公钥、管理员 API、兼容性约束和旧安装迁移见 [RELEASE.md](RELEASE.md)。
 
 本地测试 Agent 也需要以 root 启动：
 
@@ -156,19 +158,19 @@ arch: amd64
 
 “停止并解除阻塞”会停止该 App 所有已登记版本，再将初始化标记失效，保留数据和审计。无法确认进程停止时继续保持阻塞。版本数据不自动复制，清理操作不可恢复。仓库删除会检查本地安装、当前/目标/回退版本及进行中的任务引用，包括离线节点记录。
 
-单次脚本输出截断到 64 KiB，单条事件最多约 12 KiB，每个操作保留最多 2,000 条事件。生产安装器使用独立 journal namespace，磁盘日志总量上限 256 MiB、内存日志上限 64 MiB，保留最多 7 天。用户模式开发服务使用宿主机 journal 配额。应用自行写入 `log/` 的文件须由应用轮转。
+单次脚本输出截断到 64 KiB，单条事件最多约 12 KiB，每个操作保留最多 2,000 条事件。launcher 将服务日志写入 `logs/agent.log`、`logs/server.log`，各保留当前和上一份，每份约 16 MiB。应用自行写入 `log/` 的文件须由应用轮转。
 
 后台每小时维护：删除过期会话、验证挑战，清理 30 天前任务事件，压缩已结束 30 天的任务明细（保留去重记录），保留最近 10,000 条审计。待现场核对的操作不压缩。Agent 仅清理超过 7 天且无安装/任务引用的下载缓存、超过 24 小时的无活动临时目录，**不会自动清理任何版本的业务 data**。原始版本包由管理员显式管理。
 
 控制端每天自动保存一致性 SQLite 快照、密钥及可用包归档，保留最近 7 份，位置为 `backups/YYYY-MM-DD/`。包归档采用同盘硬链接，避免每天重复占用整份包空间；这些本机备份不能抵御磁盘损坏，应由宿主机备份系统复制到其他介质。备份恢复只接受当前结构和一个不存在的新目录。恢复后的节点首次重连会核对较新的本地状态、隔离旧快照任务；在页面执行“停止并解除阻塞”后再部署，避免重放曾经执行过的清理或切换。快照之后尚未备份的仓库包需重新上传：
 
 ```bash
-sudo systemctl stop deployer-server
-sudo -u deployer-control /data/deployer/bin/deployerctl restore-backup \
+sudo /data/deployer/lifecycle/server/stop.sh
+sudo /data/deployer/bin/deployerctl restore-backup \
   --backup /data/deployer/controller/backups/2026-10-18 \
   --data /data/deployer/controller-restored
 # 修改 server.env 中的数据目录后启动
-sudo systemctl start deployer-server
+sudo /data/deployer/lifecycle/server/start.sh
 ```
 
 若主机在快照之后接入，恢复后仍凭合法 mTLS 心跳重新登记，无需人工授权。保留原 Agent 数据目录和证书身份即可；恢复后同样核对较新的本地部署状态。
@@ -176,10 +178,10 @@ sudo systemctl start deployer-server
 丢失密码和所有恢复码时，可在控制端本机停服后重置内置管理员。该命令同时解除验证码、撤销旧会话，并记录审计；运行用户应与控制端服务一致，避免生成错误属主的数据库文件：
 
 ```bash
-sudo systemctl stop deployer-server
-sudo -u deployer-control /data/deployer/bin/deployerctl reset-admin \
+sudo /data/deployer/lifecycle/server/stop.sh
+sudo /data/deployer/bin/deployerctl reset-admin \
   --data /data/deployer/controller --confirm
-sudo systemctl start deployer-server
+sudo /data/deployer/lifecycle/server/start.sh
 ```
 
 工具按长期运行设计，但客户端证书会自动续期；系统时间同步、CA 到期轮换、硬件和磁盘容量仍由宿主机保障。健康检查需能反映业务是否可用；无法确认进程已停止时保留阻塞，需要人工核对。
@@ -193,7 +195,7 @@ go vet ./...
 go test ./internal/supervisor -v -count=1
 ```
 
-普通测试使用随机临时目录和随机本地 HTTP 端口，不依赖已有数据库。真实脚本测试使用随机临时目录，验证进程生命周期、重复启动、Agent 重新读取进程身份、残留子进程、超时取消、健康错误保存及卸载前停止；不创建应用 systemd 服务。
+普通测试使用随机临时目录和随机本地 HTTP 端口，不依赖已有数据库。真实脚本测试使用随机临时目录，验证进程生命周期、重复启动、Agent 重新读取进程身份、残留子进程、超时取消、健康错误保存及卸载前停止；不依赖服务管理器。
 
 设计与验收范围见 [DESIGN.md](DESIGN.md)，本轮可靠性复查见 [RELIABILITY.md](RELIABILITY.md)。当前数据库结构与 Agent 协议标记均为 `3`，仅维护这一版数据结构及协议，不提供开发期旧结构迁移。不要删除共享数据库或其他项目数据。
 

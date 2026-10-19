@@ -57,7 +57,7 @@ type Interface interface {
 }
 
 // Direct executes trusted App scripts as the Agent's root user, without an App
-// systemd unit. start.sh must remain in the foreground (usually exec the App).
+// service-manager unit. start.sh must remain in the foreground (usually exec the App).
 type Direct struct{}
 
 type processRecord struct {

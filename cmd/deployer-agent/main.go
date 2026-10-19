@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"deployer/internal/selfupdate"
+	"encoding/json"
 	"flag"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -16,6 +19,7 @@ import (
 )
 
 func main() {
+	version := flag.Bool("version", false, "print build metadata")
 	hostname, _ := os.Hostname()
 	server := flag.String("server", env("DEPLOYER_SERVER", "https://18.138.124.233:7710"), "控制端根地址")
 	data := flag.String("data", env("DEPLOYER_DATA", "./data/agent"), "独立数据目录")
@@ -25,6 +29,13 @@ func main() {
 	name := flag.String("name", env("DEPLOYER_NODE_NAME", hostname), "节点名称")
 	stopApps := flag.Bool("stop-apps", false, "Agent 已停止时，停止此数据目录下的全部应用（用于卸载）")
 	flag.Parse()
+	if *version {
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]string{"version": selfupdate.Version, "commit": selfupdate.Commit, "os": runtime.GOOS, "arch": runtime.GOARCH, "compatibility": selfupdate.Compatibility})
+		return
+	}
+	if os.Geteuid() != 0 {
+		log.Fatal("deployer must run as root")
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	sup := &supervisor.Direct{}

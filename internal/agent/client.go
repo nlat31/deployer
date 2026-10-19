@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"deployer/internal/launcher"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -34,14 +36,18 @@ type Identity struct {
 }
 type TLSFiles struct{ CA, Cert, Key string }
 type Client struct {
-	Name     string
-	Root     string
-	DB       *store.Store
-	HTTP     *http.Client
-	Identity Identity
-	Engine   *Engine
-	workers  sync.WaitGroup
-	running  sync.Map
+	Name       string
+	Root       string
+	DB         *store.Store
+	HTTP       *http.Client
+	Identity   Identity
+	Engine     *Engine
+	workers    sync.WaitGroup
+	gate       sync.RWMutex
+	updating   atomic.Bool
+	nextUpdate time.Time
+	lastUpdate string
+	running    sync.Map
 }
 
 func Open(root, server string, files TLSFiles, sup supervisor.Interface) (*Client, error) {
@@ -198,7 +204,7 @@ func (c *Client) download(ctx context.Context, v model.Version, dest string) err
 	return err
 }
 func (c *Client) poll(ctx context.Context) error {
-	p := model.Poll{Protocol: model.Protocol, Name: c.Name, OS: runtime.GOOS, Arch: runtime.GOARCH}
+	p := model.Poll{AgentUpdate: c.updateStatus(), Draining: launcher.Draining(), Trial: launcher.Trial(), Protocol: model.Protocol, Name: c.Name, OS: runtime.GOOS, Arch: runtime.GOARCH}
 	var st syscall.Statfs_t
 	if syscall.Statfs(c.Root, &st) == nil {
 		p.FreeBytes = st.Bavail * uint64(st.Bsize)
@@ -310,10 +316,15 @@ func (c *Client) poll(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	c.scheduleUpdate(ctx, response.Update)
+	if launcher.Draining() || launcher.Trial() {
+		return nil
+	}
 	for _, task := range response.Tasks {
 		if _, loaded := c.running.LoadOrStore(task.ID, true); loaded {
 			continue
 		}
+		c.gate.RLock()
 		c.workers.Add(1)
 		go c.executeTask(ctx, task)
 	}
@@ -321,6 +332,7 @@ func (c *Client) poll(ctx context.Context) error {
 }
 func (c *Client) executeTask(ctx context.Context, task model.Operation) {
 	defer c.workers.Done()
+	defer c.gate.RUnlock()
 	defer c.running.Delete(task.ID)
 	defer func() {
 		if p := recover(); p != nil {
@@ -379,9 +391,13 @@ func (c *Client) Run(ctx context.Context) error {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for {
-			if err := c.Engine.Observe(ctx); err != nil && ctx.Err() == nil {
-				log.Printf("状态核对: %v", err)
+			c.gate.RLock()
+			if !launcher.Draining() && !launcher.Trial() {
+				if err := c.Engine.Observe(ctx); err != nil && ctx.Err() == nil {
+					log.Printf("状态核对: %v", err)
+				}
 			}
+			c.gate.RUnlock()
 			select {
 			case <-ctx.Done():
 				return
@@ -395,9 +411,13 @@ func (c *Client) Run(ctx context.Context) error {
 		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
 		for {
-			if err := c.maintain(); err != nil && ctx.Err() == nil {
-				log.Printf("状态维护: %v", err)
+			c.gate.RLock()
+			if !launcher.Draining() && !launcher.Trial() {
+				if err := c.maintain(); err != nil && ctx.Err() == nil {
+					log.Printf("状态维护: %v", err)
+				}
 			}
+			c.gate.RUnlock()
 			select {
 			case <-ctx.Done():
 				return
@@ -412,6 +432,25 @@ func (c *Client) Run(ctx context.Context) error {
 			return nil
 		}
 
+		if launcher.Draining() {
+			c.gate.Lock()
+			err := launcher.Pulse("drained")
+			c.gate.Unlock()
+			if err != nil {
+				return err
+			}
+		} else {
+			phase := "ready"
+			if launcher.Trial() {
+				if e := c.validateTrial(ctx); e != nil {
+					phase = "unhealthy"
+					log.Printf("trial validation: %v", e)
+				}
+			}
+			if err := launcher.Pulse(phase); err != nil {
+				return err
+			}
+		}
 		if err := c.poll(ctx); err != nil {
 			// Reconnect after authentication/transport failure so renewed
 			// certificates replace the identity on a long-lived TLS session.

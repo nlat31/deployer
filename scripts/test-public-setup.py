@@ -14,31 +14,17 @@ with tempfile.TemporaryDirectory() as temporary:
     source.mkdir()
     with tarfile.open(archive) as tar:
         members = [m for m in tar.getmembers() if m.isfile()]
-        assert {Path(m.name).name for m in members} == {'deployer-agent', 'setup.sh', 'start.sh', 'stop.sh', 'remove.sh'}
+        assert {Path(m.name).name for m in members} == {'deployer-agent', 'deployer-launcher', 'setup.sh', 'start.sh', 'stop.sh', 'remove.sh'}
         for member in members:
             path = source / Path(member.name).name
             path.write_bytes(tar.extractfile(member).read())
             path.chmod(member.mode)
             if path.suffix == '.sh':
                 subprocess.run(['bash', '-n', str(path)], check=True)
-    # Keep actual binary preflight, install, flock and filesystem writes.
-    # Only privileged account/service management is mocked.
-    mock = root / 'mock'
-    mock.mkdir()
-    for command, script in {
-        'id': 'echo 0',
-        'chown': 'exit 0',
-        'systemctl': 'if [[ "$1" == --version ]]; then echo "systemd 255"; fi',
-    }.items():
-        path = mock / command
-        path.write_text('#!/bin/bash\n' + script + '\n')
-        path.chmod(0o755)
-    (root / 'etc/systemd/system').mkdir(parents=True)
+    if os.geteuid() != 0:
+        raise SystemExit('Run this test in a root user namespace (unshare -Ur).')
     script = (source / 'setup.sh').read_text()
-    for prefix in ('/data/deployer', '/etc/systemd'):
-        script = script.replace(prefix, str(root) + prefix)
-    (source / 'setup.sh').write_text(script)
-    env = dict(os.environ, PATH=str(mock) + ':' + os.environ['PATH'])
+    env = dict(os.environ, DEPLOYER_ROOT=str(root / 'data/deployer'))
     subprocess.run(['bash', str(source / 'setup.sh')], env=env, check=True, stdout=subprocess.DEVNULL)
     config = root / 'data/deployer/config'
     assert 'DEPLOYER_SERVER=https://18.138.124.233:7710' in (config / 'agent.env').read_text()
