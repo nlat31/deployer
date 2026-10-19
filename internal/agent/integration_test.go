@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -70,7 +72,17 @@ func TestControllerAgentLifecycle(t *testing.T) {
 	call("POST", "/api/login", map[string]string{"username": "admin", "password": controller.DefaultAdminPassword}, 200, &session)
 	call("POST", "/api/apps", model.App{ID: "sample", Name: "Sample"}, 403, nil)
 	csrf = session.CSRF
-	call("POST", "/api/apps", model.App{ID: "sample", Name: "Sample", Health: model.Health{Type: "process", TimeoutSeconds: 3, StableSeconds: 1}}, 200, nil)
+	var healthFailed atomic.Bool
+	appHealth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if healthFailed.Load() {
+			w.WriteHeader(503)
+			fmt.Fprint(w, `{"error":"component checksum mismatch"}`)
+			return
+		}
+		fmt.Fprint(w, `{"ready":false,"status":"initializing"}`)
+	}))
+	defer appHealth.Close()
+	call("POST", "/api/apps", model.App{ID: "sample", Name: "Sample", Health: model.Health{Type: "http", Target: appHealth.URL, TimeoutSeconds: 3, StableSeconds: 1}}, 200, nil)
 	h := newHarness(t)
 	v := h.version("1.0.0")
 	raw, _ := os.ReadFile(h.archives[v.Version])
@@ -123,6 +135,47 @@ func TestControllerAgentLifecycle(t *testing.T) {
 	if o := wait(op.ID); o.Result != "succeeded" {
 		t.Fatal(o)
 	}
+	// A runtime App error must reach the administrator over real mTLS polls,
+	// without stopping/restarting the App or changing its selected version.
+	sup.mu.Lock()
+	startsBeforeError := sup.starts
+	sup.mu.Unlock()
+	checkHealthReport := func(want string) {
+		t.Helper()
+		deadline := time.Now().Add(20 * time.Second)
+		for time.Now().Before(deadline) {
+			var state struct {
+				Deployments []model.Deployment              `json:"deployments"`
+				Inventories map[string][]model.Installation `json:"inventories"`
+			}
+			call("GET", "/api/snapshot", nil, 200, &state)
+			if len(state.Deployments) == 1 {
+				d := state.Deployments[0]
+				if d.Health == want && ((want == "unhealthy" && strings.Contains(d.Error, "component checksum mismatch")) || (want == "healthy" && d.Error == "")) {
+					if d.Current != "1.0.0" || d.RunState != "running" {
+						t.Fatal("health report changed deployment", d)
+					}
+					items := state.Inventories[client.Identity.NodeID]
+					if len(items) != 1 || items[0].AppID != "sample" || items[0].Version != "1.0.0" || items[0].InstalledAt <= 0 || items[0].StartedAt < items[0].InstalledAt || d.RunningVersion != "1.0.0" {
+						t.Fatal("heartbeat lost inventory, running version or lifecycle times", state)
+					}
+					return
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Fatal("application health/error did not reach controller", want)
+	}
+	healthFailed.Store(true)
+	checkHealthReport("unhealthy")
+	sup.mu.Lock()
+	startsAfterError := sup.starts
+	sup.mu.Unlock()
+	if startsAfterError != startsBeforeError {
+		t.Fatal("health failure restarted application")
+	}
+	healthFailed.Store(false)
+	checkHealthReport("healthy")
 	call("DELETE", "/api/apps/sample/versions/1.0.0", nil, 400, nil)
 	req = model.OperationRequest{Action: "stop", ExpectedRevision: op.Revision, IdempotencyKey: model.ID()}
 	call("POST", path, req, 202, &op)
@@ -188,27 +241,25 @@ func TestControllerAgentLifecycle(t *testing.T) {
 	if !completed {
 		t.Fatal("batch timed out")
 	}
-	var deletion controller.Deletion
-	call("DELETE", "/api/apps/sample?confirm=true", nil, 202, &deletion)
-	if len(deletion.Operations) != 2 {
-		t.Fatal(deletion)
-	}
-	for _, id := range deletion.Operations {
-		if o := wait(id); o.Result != "succeeded" {
-			t.Fatal(o)
-		}
-	}
+	call("DELETE", "/api/apps/sample?confirm=true", nil, 200, nil)
+	deadline = time.Now().Add(20 * time.Second)
 	for _, c := range []*Client{client, second} {
-		if _, err := os.Stat(filepath.Join(c.Root, "apps/sample")); !os.IsNotExist(err) {
-			t.Fatal("client directory remains", err)
+		for {
+			_, err := os.Stat(filepath.Join(c.Root, "apps/sample"))
+			if os.IsNotExist(err) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("heartbeat cleanup did not remove directory", err)
+			}
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 	var final struct {
-		Apps      []model.App           `json:"apps"`
-		Deletions []controller.Deletion `json:"deletions"`
+		Apps []model.App `json:"apps"`
 	}
 	call("GET", "/api/snapshot", nil, 200, &final)
-	if len(final.Apps) != 0 || len(final.Deletions) != 1 || final.Deletions[0].State != "completed" {
+	if len(final.Apps) != 0 {
 		t.Fatal(final)
 	}
 	call("POST", "/api/users", map[string]any{"id": "reader", "name": "Reader", "role": "viewer", "password": "reader-password-123"}, 200, nil)

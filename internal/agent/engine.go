@@ -124,7 +124,7 @@ func (e *Engine) Accept(o model.Operation) (bool, error) {
 			d.DesiredState = "stopped"
 		}
 		switch o.Action {
-		case "deploy", "switch", "rollback", "start", "restart":
+		case "deploy", "switch", "start", "restart":
 			d.DesiredVersion = o.Version
 			d.DesiredState = "stopped"
 			if o.Start {
@@ -258,7 +258,7 @@ func (e *Engine) Run(ctx context.Context, id string) error {
 			}
 			return e.finishTx(t, &o, d, "succeeded", "")
 		})
-	case "install", "deploy", "switch", "rollback", "start", "restart":
+	case "install", "deploy", "switch", "start", "restart":
 		if err = e.phase(&o, "preparing"); err == nil {
 			err = e.prepare(ctx, &o, log)
 		}
@@ -268,7 +268,7 @@ func (e *Engine) Run(ctx context.Context, id string) error {
 		if o.Action == "install" {
 			break
 		}
-		if d.Current != "" {
+		if d.Current != "" && o.Action != "start" {
 			if err = e.phase(&o, "stopping"); err != nil {
 				break
 			}
@@ -287,6 +287,14 @@ func (e *Engine) Run(ctx context.Context, id string) error {
 			if err = e.Supervisor.Start(ctx, sp); err != nil {
 				break
 			}
+			st, statusErr := e.Supervisor.Status(ctx, sp)
+			if statusErr != nil {
+				err = statusErr
+				break
+			}
+			if err = e.recordStartedAt(o.AppID, o.Version, st.StartedAt); err != nil {
+				break
+			}
 			if err = e.phase(&o, "checking"); err != nil {
 				break
 			}
@@ -303,10 +311,6 @@ func (e *Engine) Run(ctx context.Context, id string) error {
 			d.RunState = "stopped"
 			d.RunningVersion = ""
 			d.Health = "unverified"
-		}
-		if d.Current != o.Version {
-			d.Previous = d.Current
-			d.PreviousConfig = d.Config
 		}
 		d.Current = o.Version
 		d.Config = o.Config
@@ -333,14 +337,7 @@ func (e *Engine) Run(ctx context.Context, id string) error {
 		d.RunningVersion = ""
 		d.Health = "unverified"
 
-	case "clear_rollback":
-		d.Previous = ""
-		d.PreviousConfig = model.Config{}
 	case "clean_data":
-		if o.Version == d.Previous {
-			err = fmt.Errorf("当前或回退版本受到保护")
-			break
-		}
 		if o.Version == d.Current && d.DesiredState != "stopped" {
 			err = fmt.Errorf("必须先停止当前版本")
 			break
@@ -417,8 +414,8 @@ func (e *Engine) Run(ctx context.Context, id string) error {
 	}
 	if err != nil {
 		_ = e.Event(o, err.Error())
-		if disturbed && (o.Action == "deploy" || o.Action == "switch" || o.Action == "rollback" || o.Action == "start" || o.Action == "restart") {
-			return e.restore(ctx, &o, err.Error())
+		if disturbed && (o.Action == "deploy" || o.Action == "switch" || o.Action == "start" || o.Action == "restart") {
+			return e.reportFailure(ctx, &o, err.Error())
 		}
 		if disturbed {
 			d.DesiredState = "stopped"
@@ -453,11 +450,6 @@ func (e *Engine) finishTx(t *store.Tx, o *model.Operation, d model.Deployment, r
 	d.Revision = o.Revision
 	d.ObservedAt = model.Now()
 	d.Error = message
-	if result == "succeeded" && o.Action != "logs" && o.Action != "install" {
-		d.RestartFailures = 0
-		d.NextRestartAt = 0
-		d.UnhealthySince = 0
-	}
 	if err := store.Put(t, "deployments", o.AppID, d); err != nil {
 		return err
 	}
@@ -502,65 +494,48 @@ func (e *Engine) currentLink(d model.Deployment) error {
 	}
 	return store.SyncDir(root)
 }
-func (e *Engine) restore(ctx context.Context, o *model.Operation, cause string) error {
-	if err := e.phase(o, "recovering"); err != nil {
-		return err
-	}
+
+// Record the selected target and observed process without stopping, restarting,
+// or rolling back application versions. Only an administrator changes versions.
+func (e *Engine) reportFailure(ctx context.Context, o *model.Operation, cause string) error {
 	d := o.Before
 	d.Revision = o.Revision
-	log := func(s string) { _ = e.Event(*o, s) }
-	if o.Version != "" {
-		if err := e.Supervisor.Stop(ctx, e.spec(*o, o.Version, o.Config), log); err != nil {
+	if o.Stage == "stopping" {
+		d.DesiredState = "stopped"
+		d.RunState = "unknown"
+		d.Health = "unknown"
+		return e.finish(o, d, "needs_attention", cause)
+	}
+	if d.Current != "" && d.Current != o.Version {
+		old, err := e.Supervisor.Status(ctx, e.spec(*o, d.Current, d.Config))
+		if err != nil || old.Running {
 			d.DesiredState = "stopped"
 			d.RunState = "unknown"
 			d.Health = "unknown"
-			return e.finish(o, d, "needs_attention", cause+"；无法确认目标版本已停止: "+err.Error())
+			return e.finish(o, d, "needs_attention", cause+"；旧版本状态需管理员核对")
 		}
 	}
-	if !o.Config.AutoRollback || d.Current == "" {
-		if d.Current != "" && d.Current != o.Version {
-			if err := e.Supervisor.Stop(ctx, e.spec(*o, d.Current, d.Config), log); err != nil {
-				d.DesiredState = "stopped"
-				d.RunState = "unknown"
-				d.Health = "unknown"
-				return e.finish(o, d, "needs_attention", cause+"；无法确认旧版本停止: "+err.Error())
-			}
-		}
-		d.DesiredState = "stopped"
-		d.DesiredVersion = d.Current
-		d.RunState = "stopped"
-		d.RunningVersion = ""
-		d.Health = "unverified"
-		return e.finish(o, d, "failed", cause)
+	d.Current = o.Version
+	d.Config = o.Config
+	d.DesiredVersion = o.Version
+	d.DesiredState = "stopped"
+	if o.Start {
+		d.DesiredState = "running"
 	}
-	if d.DesiredState == "running" {
-		sp := e.spec(*o, d.Current, d.Config)
-		err := e.Supervisor.Start(ctx, sp)
-		if err == nil {
-			err = supervisor.Healthy(ctx, e.Supervisor, sp, d.Config.Health)
-		}
-		if err != nil {
-			stopErr := e.Supervisor.Stop(ctx, sp, log)
-			d.DesiredState = "stopped"
-			d.RunState = "stopped"
-			d.RunningVersion = ""
-			d.Health = "unverified"
-			result := "failed_recovery"
-			if stopErr != nil {
-				result = "needs_attention"
-				d.RunState = "unknown"
-			}
-			return e.finish(o, d, result, cause+"；旧版本恢复失败: "+err.Error())
-		}
+	st, err := e.Supervisor.Status(ctx, e.spec(*o, o.Version, o.Config))
+	if err != nil {
+		d.RunState = "unknown"
+		d.Health = "unknown"
+		return e.finish(o, d, "needs_attention", cause+"；进程状态检查失败: "+err.Error())
+	}
+	d.RunState = "stopped"
+	d.RunningVersion = ""
+	d.Health = "unhealthy"
+	if st.Running {
 		d.RunState = "running"
-		d.RunningVersion = d.Current
-		d.Health = "healthy"
-		if d.Config.Health.Type == "process" {
-			d.Health = "process_running"
-		}
+		d.RunningVersion = o.Version
 	}
-	d.DesiredVersion = d.Current
-	return e.finish(o, d, "failed_recovered", cause)
+	return e.finish(o, d, "failed", cause)
 }
 
 func (e *Engine) prepare(ctx context.Context, o *model.Operation, log func(string)) error {
@@ -593,7 +568,7 @@ func (e *Engine) prepare(ctx context.Context, o *model.Operation, log func(strin
 		if _, er := os.Lstat(sp.Dir()); er == nil {
 			return fmt.Errorf("发现未登记的版本目录，拒绝覆盖")
 		}
-		ins = model.Installation{AppID: o.AppID, Version: o.Version, Digest: v.Digest, DataEpoch: 1, InstalledAt: model.Now()}
+		ins = model.Installation{AppID: o.AppID, Version: o.Version, Digest: v.Digest, DataEpoch: 1}
 		if err = e.DB.Update(func(t *store.Tx) error { return store.Put(t, "installations", model.Key(o.AppID, o.Version), ins) }); err != nil {
 			return err
 		}
@@ -645,6 +620,14 @@ func (e *Engine) prepare(ctx context.Context, o *model.Operation, log func(strin
 	}
 	if err = packages.PlainDir(sp.Dir()); err != nil {
 		return err
+	}
+	// Registration precedes downloading for crash recovery. Only timestamp a
+	// deployment once its validated package actually exists on disk.
+	if ins.InstalledAt == 0 {
+		ins.InstalledAt = model.Now()
+		if err = e.DB.Update(func(t *store.Tx) error { return store.Put(t, "installations", model.Key(o.AppID, o.Version), ins) }); err != nil {
+			return err
+		}
 	}
 	for _, dir := range []string{"config", "data", "logs", "run"} {
 		if err = os.MkdirAll(filepath.Join(sp.Dir(), dir), 0700); err != nil {
@@ -750,12 +733,12 @@ func (e *Engine) RecoverOperation(ctx context.Context, o model.Operation) error 
 	}
 	switch o.Stage {
 	case "starting", "checking", "recovering":
-		if er := e.restore(ctx, &o, "Agent 重启时发现未提交的版本切换"); er != nil {
+		if er := e.reportFailure(ctx, &o, "Agent 重启时发现未提交的版本切换，请管理员核对"); er != nil {
 			return er
 		}
 	case "stopping":
-		if o.Action == "switch" || o.Action == "deploy" || o.Action == "rollback" || o.Action == "restart" || o.Action == "start" {
-			if er := e.restore(ctx, &o, "Agent 重启时发现中断的停止阶段"); er != nil {
+		if o.Action == "switch" || o.Action == "deploy" || o.Action == "restart" || o.Action == "start" {
+			if er := e.reportFailure(ctx, &o, "Agent 重启时发现中断的停止阶段，请管理员核对"); er != nil {
 				return er
 			}
 		} else if er := e.Run(ctx, o.ID); er != nil {
@@ -815,28 +798,47 @@ func (e *Engine) observeOne(ctx context.Context, d model.Deployment) error {
 	}
 	sp := supervisor.Spec{Root: e.Root, AppID: d.AppID, Version: d.Current, OperationID: model.ID(), Env: d.Config.Env}
 	st, err := e.Supervisor.Status(ctx, sp)
+	if err == nil {
+		if recordErr := e.recordStartedAt(d.AppID, d.Current, st.StartedAt); recordErr != nil {
+			return recordErr
+		}
+	}
 	d.ObservedAt = model.Now()
 	if err != nil {
 		d.RunState = "unknown"
 		d.Health = "unknown"
+		d.Error = "进程状态检查失败: " + err.Error()
 	} else if st.Running {
 		d.RunState = "running"
 		d.RunningVersion = d.Current
 		if err := supervisor.Probe(ctx, e.Supervisor, sp, d.Config.Health); err != nil {
 			d.Health = "unhealthy"
+			d.Error = err.Error()
 		} else if d.Config.Health.Type == "process" {
 			d.Health = "process_running"
+			d.Error = ""
 		} else {
 			d.Health = "healthy"
+			d.Error = ""
 		}
 	} else {
 		d.RunState = "stopped"
 		d.RunningVersion = ""
 		d.Health = "unverified"
+		if d.DesiredState == "running" {
+			d.Health = "unhealthy"
+			if d.Error == "" {
+				d.Error = "主进程未运行"
+			}
+		}
 	}
-	if err == nil {
-		if err = e.heal(ctx, &d, sp, st); err != nil {
-			return err
+	// Health bodies are application-owned; apply the same configured-secret
+	// redaction as task errors before publishing them to the controller.
+	for _, cfg := range []model.Config{d.Config} {
+		for _, value := range cfg.Env {
+			if len(value) >= 3 {
+				d.Error = strings.ReplaceAll(d.Error, value, "[redacted]")
+			}
 		}
 	}
 	if err = e.DB.Update(func(t *store.Tx) error {
@@ -855,51 +857,28 @@ func (e *Engine) observeOne(ctx context.Context, d model.Deployment) error {
 	return nil
 }
 
+// Startup only observes applications. A previous running intent is not a new
+// administrator command and must never start an application after a host reboot.
 func (e *Engine) Boot(ctx context.Context) error {
-	b, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
-	if err != nil {
-		return err
-	}
-	boot := strings.TrimSpace(string(b))
-	var old string
-	err = e.DB.View(func(t *store.Tx) error {
-		var er error
-		old, er = store.Get[string](t, "settings", "boot_id")
-		if errors.Is(er, store.ErrNotFound) {
-			return nil
-		}
-		return er
-	})
-	if err != nil {
-		return err
-	}
-	if old == boot {
+	return e.Observe(ctx)
+}
+
+// The process record survives Agent restarts and interrupted operations. A
+// repeated start.sh invocation keeps that record, so it cannot reset this time.
+func (e *Engine) recordStartedAt(app, version string, startedAt int64) error {
+	if startedAt <= 0 {
 		return nil
 	}
-	var deps []model.Deployment
-	if err = e.DB.View(func(t *store.Tx) error {
-		var er error
-		deps, er = store.List[model.Deployment](t, "deployments")
-		return er
-	}); err != nil {
-		return err
-	}
-	for _, d := range deps {
-		if d.Current == "" || d.DesiredState != "running" {
-			continue
-		}
-		sp := supervisor.Spec{Root: e.Root, AppID: d.AppID, Version: d.Current, OperationID: model.ID(), Env: d.Config.Env}
-		err = e.Supervisor.Start(ctx, sp)
-		if err == nil {
-			err = supervisor.Healthy(ctx, e.Supervisor, sp, d.Config.Health)
-		}
+	return e.DB.Update(func(t *store.Tx) error {
+		key := model.Key(app, version)
+		ins, err := store.Get[model.Installation](t, "installations", key)
 		if err != nil {
-			d.Error = "开机恢复失败: " + err.Error()
-			d.RunState = "unknown"
-			if er := e.DB.Update(func(t *store.Tx) error { return store.Put(t, "deployments", d.AppID, d) }); er != nil {
-				return er
-			}
+			return err
 		}
-	}
-	return e.DB.Update(func(t *store.Tx) error { return store.Put(t, "settings", "boot_id", boot) })
+		if ins.StartedAt == startedAt {
+			return nil
+		}
+		ins.StartedAt = startedAt
+		return store.Put(t, "installations", key, ins)
+	})
 }

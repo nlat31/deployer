@@ -227,3 +227,38 @@ func TestInterruptedRemoveIsIdempotent(t *testing.T) {
 		t.Fatal("removal state survived", e)
 	}
 }
+
+func TestManualInstallSupersedesStaleAutomaticRequest(t *testing.T) {
+	for _, same := range []bool{true, false} {
+		t.Run(fmt.Sprint(same), func(t *testing.T) {
+			r, old, good := fixture(t)
+			if err := selfupdate.Save(r.request(), map[string]string{"digest": old}); err != nil {
+				t.Fatal(err)
+			}
+			download := filepath.Join(r.Root, "updater", "agent-download.json")
+			if err := selfupdate.Save(download, map[string]string{"target": old, "phase": "staged"}); err != nil {
+				t.Fatal(err)
+			}
+			target := good
+			if same {
+				target = old
+			}
+			if err := r.Install(r.Binary(target)); err != nil {
+				t.Fatal(err)
+			}
+			for _, path := range []string{r.request(), download} {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatal("obsolete request remains", path, err)
+				}
+			}
+			if !same {
+				run(t, r)
+				wait(t, func() bool { s, _ := r.load(); return s.Current == good && s.Phase == "committed" })
+				time.Sleep(candidateDelay * 3)
+				if state, _ := r.load(); state.Current != good {
+					t.Fatal("manual release replaced by stale automatic request", state)
+				}
+			}
+		})
+	}
+}

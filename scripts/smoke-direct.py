@@ -129,7 +129,6 @@ try:
     print('explicit stop: remains stopped after observer cycle', flush=True)
     operation('clean_data', '1.1.0')
     operation('start')
-    operation('clear_rollback')
     operation('clean_data', '1.0.0')
     operation('remove_version', '1.0.0')
     operation('stop')

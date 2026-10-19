@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"deployer/internal/model"
 	"deployer/internal/packages"
@@ -22,6 +23,7 @@ import (
 type fakeSupervisor struct {
 	mu         sync.Mutex
 	running    map[string]bool
+	startedAt  map[string]int64
 	failStart  map[string]bool
 	setupCount int
 	cleanCount int
@@ -31,7 +33,7 @@ type fakeSupervisor struct {
 }
 
 func newFake() *fakeSupervisor {
-	return &fakeSupervisor{running: map[string]bool{}, failStart: map[string]bool{}}
+	return &fakeSupervisor{running: map[string]bool{}, startedAt: map[string]int64{}, failStart: map[string]bool{}}
 }
 func (f *fakeSupervisor) Prepare(s supervisor.Spec) error { return nil }
 func (f *fakeSupervisor) Hook(ctx context.Context, s supervisor.Spec, script string, log func(string)) error {
@@ -63,6 +65,9 @@ func (f *fakeSupervisor) Start(ctx context.Context, s supervisor.Spec) error {
 	defer f.mu.Unlock()
 	if f.failStart[s.Version] {
 		return fmt.Errorf("intentional start failure")
+	}
+	if !f.running[s.Version] {
+		f.startedAt[s.Version] = model.Now()
 	}
 	f.running[s.Version] = true
 	f.starts++
@@ -115,7 +120,7 @@ func (f *fakeSupervisor) Status(ctx context.Context, s supervisor.Spec) (supervi
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.running[s.Version] {
-		return supervisor.Status{Running: true, PID: 123, State: "active"}, nil
+		return supervisor.Status{Running: true, PID: 123, State: "active", StartedAt: f.startedAt[s.Version]}, nil
 	}
 	return supervisor.Status{State: "inactive"}, nil
 }
@@ -188,7 +193,7 @@ func (h *harness) op(action, version string, artifact *model.Version) model.Oper
 	d := h.deployment()
 	c := d.Config
 	if c.ID == "" {
-		c = model.Config{ID: model.ID(), Health: model.Health{Type: "process", TimeoutSeconds: 2, StableSeconds: 1}, AutoRollback: true}
+		c = model.Config{ID: model.ID(), Health: model.Health{Type: "process", TimeoutSeconds: 2, StableSeconds: 1}}
 	}
 	o := model.Operation{ID: model.ID(), NodeID: "node", AppID: "sample", Action: action, Version: version, Artifact: artifact, ExpectedRevision: d.Revision, Revision: d.Revision + 1, Config: c, Start: true}
 	h.db.View(func(tx *store.Tx) error {
@@ -227,12 +232,12 @@ func TestDeploySwitchFailureAndNoDoubleInstance(t *testing.T) {
 	}
 	h.sup.failStart[b.Version] = true
 	o = h.run(h.op("switch", b.Version, &b))
-	if o.Result != "failed_recovered" || h.deployment().Current != a.Version || !h.sup.running[a.Version] {
-		t.Fatal("failed to recover", o)
+	if o.Result != "failed" || h.deployment().Current != b.Version || h.sup.running[a.Version] || h.sup.running[b.Version] {
+		t.Fatal("failure changed versions automatically", o)
 	}
 	h.sup.failStart[b.Version] = false
 	o = h.run(h.op("switch", b.Version, &b))
-	if o.Result != "succeeded" || h.deployment().Previous != a.Version {
+	if o.Result != "succeeded" || h.deployment().Current != b.Version {
 		t.Fatal("switch failed", o)
 	}
 	if h.sup.maxRunning != 1 {
@@ -311,7 +316,135 @@ func TestRecoveryAfterStartBeforeCommit(t *testing.T) {
 	}
 	var final model.Operation
 	h.db.View(func(tx *store.Tx) error { final, _ = store.Get[model.Operation](tx, "operations", o.ID); return nil })
-	if final.Result != "failed_recovered" || h.deployment().Current != a.Version || h.sup.running[b.Version] || !h.sup.running[a.Version] {
+	if final.Result != "failed" || h.deployment().Current != b.Version || !h.sup.running[b.Version] || h.sup.running[a.Version] {
 		t.Fatal("unsafe recovery", final)
+	}
+}
+
+func TestVersionDeploymentAndStartTimes(t *testing.T) {
+	h := newHarness(t)
+	get := func(version string) model.Installation {
+		t.Helper()
+		var i model.Installation
+		if err := h.db.View(func(tx *store.Tx) error {
+			var err error
+			i, err = store.Get[model.Installation](tx, "installations", model.Key("sample", version))
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return i
+	}
+	v1, v2 := h.version("1"), h.version("2")
+	download := h.e.Download
+	h.e.Download = func(context.Context, model.Version, string) error { return fmt.Errorf("download failed") }
+	if o := h.run(h.op("install", "1", &v1)); o.Result != "failed" {
+		t.Fatal(o)
+	}
+	if i := get("1"); i.InstalledAt != 0 || i.StartedAt != 0 {
+		t.Fatal("failed download reported deployment", i)
+	}
+	h.e.Download = download
+	if o := h.run(h.op("install", "1", &v1)); o.Result != "succeeded" {
+		t.Fatal(o)
+	}
+	installed := get("1")
+	if installed.InstalledAt <= 0 || installed.StartedAt != 0 {
+		t.Fatal(installed)
+	}
+	h.run(h.op("install", "1", &v1))
+	if i := get("1"); i.InstalledAt != installed.InstalledAt {
+		t.Fatal("repeat install reset time", i)
+	}
+	h.run(h.op("deploy", "1", &v1))
+	started := get("1")
+	if started.StartedAt < installed.InstalledAt {
+		t.Fatal(started)
+	}
+	h.run(h.op("start", "1", &v1))
+	if err := h.e.Boot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if i := get("1"); i.StartedAt != started.StartedAt {
+		t.Fatal("idempotent start or Agent boot reset time", i)
+	}
+	// Recover a start timestamp lost between process creation and inventory persistence.
+	lost := get("1")
+	lost.StartedAt = 0
+	if err := h.db.Update(func(tx *store.Tx) error {
+		i := lost
+		return store.Put(tx, "installations", model.Key("sample", "1"), i)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.e.Observe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if i := get("1"); i.StartedAt != started.StartedAt {
+		t.Fatal("observation lost durable process start", i)
+	}
+	h.run(h.op("stop", "1", nil))
+	if i := get("1"); i.StartedAt != started.StartedAt {
+		t.Fatal("stop erased start time", i)
+	}
+	time.Sleep(2 * time.Millisecond)
+	h.run(h.op("start", "1", &v1))
+	restarted := get("1")
+	if restarted.StartedAt <= started.StartedAt || restarted.InstalledAt != installed.InstalledAt {
+		t.Fatal("restart timestamps", restarted)
+	}
+	h.run(h.op("switch", "2", &v2))
+	if i := get("1"); i.StartedAt != restarted.StartedAt || i.InstalledAt != installed.InstalledAt {
+		t.Fatal("switch changed old version times", i)
+	}
+	if i := get("2"); i.InstalledAt == 0 || i.StartedAt == 0 {
+		t.Fatal("new version missing times", i)
+	}
+}
+
+func TestHeartbeatCleanupStopsRetriesAndCreatesNoTasks(t *testing.T) {
+	h := newHarness(t)
+	a := h.version("1")
+	b := h.version("2")
+	h.run(h.op("deploy", a.Version, &a))
+	h.run(h.op("install", b.Version, &b))
+	count := func() int {
+		var ops []model.Operation
+		h.e.DB.View(func(tx *store.Tx) error { ops, _ = store.List[model.Operation](tx, "operations"); return nil })
+		return len(ops)
+	}
+	before := count()
+	item := model.Deleted{AppID: "sample", Version: "1"}
+	h.sup.failStop = true
+	if err := h.e.SyncDeleted(context.Background(), item); err == nil {
+		t.Fatal("stop failure hidden")
+	}
+	if h.deployment().CleanupError == "" {
+		t.Fatal("cleanup failure not reported")
+	}
+	if _, err := os.Stat(filepath.Join(h.e.Root, "apps/sample/versions/1")); err != nil {
+		t.Fatal("directory removed before stop", err)
+	}
+	h.sup.failStop = false
+	if err := h.e.SyncDeleted(context.Background(), item); err != nil {
+		t.Fatal(err)
+	}
+	if h.sup.running["1"] || h.deployment().Current != "" || h.deployment().CleanupError != "" {
+		t.Fatal(h.deployment())
+	}
+	if _, err := os.Stat(filepath.Join(h.e.Root, "apps/sample/versions/2")); err != nil {
+		t.Fatal("unrelated version removed", err)
+	}
+	if err := h.e.SyncDeleted(context.Background(), model.Deleted{AppID: "sample"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.e.SyncDeleted(context.Background(), model.Deleted{AppID: "sample"}); err != nil {
+		t.Fatal("repeat cleanup", err)
+	}
+	if _, err := os.Stat(filepath.Join(h.e.Root, "apps/sample")); !os.IsNotExist(err) {
+		t.Fatal("app directory remains", err)
+	}
+	if count() != before {
+		t.Fatal("heartbeat cleanup created tasks")
 	}
 }

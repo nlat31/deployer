@@ -133,7 +133,6 @@ operation('clean_data', '1.1.0')
 assert ssh('sudo -n find /data/deployer/agent/apps/sample-app/versions/1.1.0/data -mindepth 1 -print -quit') == ''
 record('data directory cleared')
 operation('start')
-operation('clear_rollback')
 operation('clean_data', '1.0.0')
 operation('remove_version', '1.0.0')
 assert ssh('sudo -n test ! -e /data/deployer/agent/apps/sample-app/versions/1.0.0 && echo removed') == 'removed'

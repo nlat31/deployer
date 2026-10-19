@@ -203,3 +203,84 @@ func TestOfflineHostManualDeleteAndAuthenticatedReappearance(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestHeartbeatAcceptsRemovedOptionalFieldsDuringRollingUpdate(t *testing.T) {
+	s, pki, ts := newMTLSTestServer(t)
+	files := pki.Node(t, "older-agent")
+	client := certClient(t, pki, &files)
+	pollRequest(t, client, ts, model.Poll{}, 200)
+	if err := s.DB.Update(func(tx *store.Tx) error {
+		return store.Put(tx, "deployments", model.NodeKey("older-agent", "app"), model.Deployment{NodeID: "older-agent", AppID: "app", Revision: 1})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"protocol":3,"name":"older agent","os":"linux","arch":"amd64","deployments":[{"app_id":"app","revision":1,"config":{"auto_rollback":true},"previous_config":{"auto_rollback":true}}]}`
+	response, err := client.Post(ts.URL+"/agent/poll", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 200 {
+		raw, _ := io.ReadAll(response.Body)
+		t.Fatal(response.StatusCode, string(raw))
+	}
+	// Tolerance is limited to heartbeat payloads, not administrator commands.
+	request := httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"action":"deploy","auto_rollback":true}`))
+	var command model.OperationRequest
+	if err := decode(httptest.NewRecorder(), request, &command); err == nil {
+		t.Fatal("operator request accepted removed option")
+	}
+	request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"protocol":3} {}`))
+	var heartbeat model.Poll
+	if err := decodeLimit(httptest.NewRecorder(), request, &heartbeat, 16<<20); err == nil {
+		t.Fatal("heartbeat accepted trailing content")
+	}
+}
+
+func TestHeartbeatPersistsCompleteVersionInventory(t *testing.T) {
+	s, pki, ts := newMTLSTestServer(t)
+	files := pki.Node(t, "inventory-node")
+	c := certClient(t, pki, &files)
+	pollRequest(t, c, ts, model.Poll{}, 200)
+	deps := []model.Deployment{{AppID: "app-a", Current: "2", RunningVersion: "2", RunState: "running", Revision: 1}, {AppID: "app-b", Current: "1", RunState: "stopped", Revision: 1}}
+	if err := s.DB.Update(func(tx *store.Tx) error {
+		for _, d := range deps {
+			if err := store.Put(tx, "deployments", model.NodeKey("inventory-node", d.AppID), d); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	items := []model.Installation{{AppID: "app-a", Version: "1", InstalledAt: 1000, StartedAt: 2000}, {AppID: "app-a", Version: "2", InstalledAt: 3000, StartedAt: 4000}, {AppID: "app-b", Version: "1", InstalledAt: 5000}}
+	for n := 0; n < 2; n++ {
+		pollRequest(t, c, ts, model.Poll{Deployments: deps, Installations: items}, 200)
+		if err := s.DB.View(func(tx *store.Tx) error {
+			got, err := store.Get[[]model.Installation](tx, "inventories", "inventory-node")
+			if err != nil {
+				return err
+			}
+			if len(got) != len(items) {
+				t.Fatalf("incomplete inventory: %+v", got)
+			}
+			for i := range got {
+				if got[i] != items[i] {
+					t.Fatalf("heartbeat changed lifecycle times: %+v", got)
+				}
+			}
+			for _, want := range deps {
+				d, err := store.Get[model.Deployment](tx, "deployments", model.NodeKey("inventory-node", want.AppID))
+				if err != nil {
+					return err
+				}
+				if d.Current != want.Current || d.RunningVersion != want.RunningVersion || d.RunState != want.RunState {
+					t.Fatalf("incorrect runtime state: %+v", d)
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

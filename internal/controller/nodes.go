@@ -27,24 +27,6 @@ func (s *Server) deleteNode(w http.ResponseWriter, r *http.Request) error {
 		if model.Now()-n.LastSeen < 30000 {
 			return fail(409, "在线主机不能删除，请先停止该主机的 Agent")
 		}
-		jobs, e := store.List[Deletion](t, "deletions")
-		if e != nil {
-			return e
-		}
-		for _, j := range jobs {
-			if j.State == "completed" {
-				continue
-			}
-			for _, oid := range j.Operations {
-				o, e := store.Get[model.Operation](t, "operations", oid)
-				if e != nil {
-					return e
-				}
-				if o.NodeID == id {
-					return fail(409, "主机仍有客户端删除任务，不能移除")
-				}
-			}
-		}
 		deps, err := store.List[model.Deployment](t, "deployments")
 		if err != nil {
 			return err

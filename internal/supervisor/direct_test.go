@@ -1,8 +1,8 @@
 package supervisor
 
 import (
-	"deployer/internal/model"
 	"context"
+	"deployer/internal/model"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -29,7 +29,11 @@ func fixture(t *testing.T) (*Direct, Spec) {
 	}
 	for name, script := range map[string]string{
 		"setup.sh": "id -u > \"$APP_DATA_DIR/uid\"\necho seed > \"$APP_DATA_DIR/seed\"\n",
-		"start.sh": "echo started\nexec sleep 300\n",
+		"start.sh": `echo call >> "$APP_DATA_DIR/start-calls"
+if [[ -n "${APP_MAIN_PID:-}" ]] && kill -0 "$APP_MAIN_PID" 2>/dev/null; then exit 0; fi
+echo started
+exec sleep 300
+`,
 		"stop.sh":  "kill -TERM \"$APP_MAIN_PID\" 2>/dev/null || true\n",
 		"clean.sh": "find \"$APP_DATA_DIR\" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +\n",
 	} {
@@ -273,5 +277,70 @@ func TestDirectRejectsPreviousBootIdentity(t *testing.T) {
 	st, err := s.Status(context.Background(), sp)
 	if err != nil || st.Running {
 		t.Fatal("stale boot accepted", st, err)
+	}
+}
+
+func TestExplicitStartAlwaysExecutesApplicationScript(t *testing.T) {
+	s, sp := fixture(t)
+	began := model.Now()
+	if err := s.Start(context.Background(), sp); err != nil {
+		t.Fatal(err)
+	}
+	first := waitRunning(t, s, sp, true)
+	if first.StartedAt < began || first.StartedAt > model.Now() {
+		t.Fatal("missing actual process start time", first)
+	}
+	if err := s.Start(context.Background(), sp); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(sp.Dir(), "data/start-calls"))
+	if err != nil || strings.Count(string(body), "call") != 2 {
+		t.Fatal("start script was skipped", string(body), err)
+	}
+	if next := waitRunning(t, &Direct{}, sp, true); next.PID != first.PID || next.StartedAt != first.StartedAt {
+		t.Fatal("App idempotence lost", next)
+	}
+	if err := os.WriteFile(filepath.Join(sp.Dir(), "start.sh"), []byte("#!/bin/bash\necho repeated-start-error >&2\nexit 17\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start(context.Background(), sp); err == nil || !strings.Contains(err.Error(), "17") {
+		t.Fatal("script error was not reported", err)
+	}
+	if next := waitRunning(t, s, sp, true); next.PID != first.PID {
+		t.Fatal("script failure stopped original App", next)
+	}
+	logs, err := s.Logs(context.Background(), sp)
+	if err != nil || !strings.Contains(logs, "repeated-start-error") {
+		t.Fatal("script stderr was lost", logs, err)
+	}
+}
+
+func TestDirectStopScriptFailureIsReportedWithoutKillingApp(t *testing.T) {
+	s, sp := fixture(t)
+	if err := s.Start(context.Background(), sp); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(sp.Dir(), "stop.sh")
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.WriteFile(path, original, 0755)
+	if err = os.WriteFile(path, []byte("#!/bin/bash\necho intentional-stop-error >&2\nexit 42\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Stop(context.Background(), sp, discardLog)
+	if err == nil || !strings.Contains(err.Error(), "intentional-stop-error") || !strings.Contains(err.Error(), "42") {
+		t.Fatal("script failure lost", err)
+	}
+	st, err := s.Status(context.Background(), sp)
+	if err != nil || !st.Running {
+		t.Fatal("failed stop killed app", st, err)
+	}
+	if err = os.WriteFile(path, original, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Stop(context.Background(), sp, discardLog); err != nil {
+		t.Fatal(err)
 	}
 }

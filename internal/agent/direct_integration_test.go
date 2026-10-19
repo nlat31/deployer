@@ -92,8 +92,8 @@ func TestDirectEngineDeploySwitchRecoverStopClean(t *testing.T) {
 	if err != nil || after.PID != before.PID {
 		t.Fatal("restart duplicated or lost process", after, err)
 	}
-	if o := h.run(h.op("switch", "bad", &versions[2])); o.Result != "failed_recovered" {
-		t.Fatal("rollback", o)
+	if o := h.run(h.op("switch", "bad", &versions[2])); o.Result != "failed" {
+		t.Fatal("manual switch", o)
 	}
 	if o := h.run(h.op("switch", "2", &versions[1])); o.Result != "succeeded" {
 		t.Fatal(o)
@@ -122,8 +122,8 @@ func TestDirectEngineDeploySwitchRecoverStopClean(t *testing.T) {
 		t.Fatal(err)
 	}
 	restored, _ := sup.Status(ctx, sp("2"))
-	if !restored.Running || restored.PID == current.PID {
-		t.Fatal("automatic recovery failed", h.deployment())
+	if restored.Running || h.deployment().Health != "unhealthy" {
+		t.Fatal("unexpected automatic restart or missing failure", h.deployment())
 	}
 	if o := h.run(h.op("stop", "2", nil)); o.Result != "succeeded" {
 		t.Fatal(o)

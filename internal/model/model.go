@@ -126,30 +126,24 @@ type Node struct {
 	CertificateExpires int64             `json:"certificate_expires"`
 }
 type Config struct {
-	ID           string            `json:"id"`
-	Env          map[string]string `json:"env,omitempty"`
-	Health       Health            `json:"health"`
-	AutoRollback bool              `json:"auto_rollback"`
+	ID     string            `json:"id"`
+	Env    map[string]string `json:"env,omitempty"`
+	Health Health            `json:"health"`
 }
 type Deployment struct {
-	NodeID          string `json:"node_id"`
-	AppID           string `json:"app_id"`
-	Current         string `json:"current"`
-	Previous        string `json:"previous"`
-	DesiredVersion  string `json:"desired_version"`
-	DesiredState    string `json:"desired_state"`
-	RunningVersion  string `json:"running_version"`
-	RunState        string `json:"run_state"`
-	Health          string `json:"health"`
-	Revision        int64  `json:"revision"`
-	ObservedAt      int64  `json:"observed_at"`
-	Error           string `json:"error"`
-	Config          Config `json:"config"`
-	PreviousConfig  Config `json:"previous_config"`
-	RestartFailures int    `json:"restart_failures"`
-	NextRestartAt   int64  `json:"next_restart_at"`
-	UnhealthySince  int64  `json:"unhealthy_since"`
-	HealthySince    int64  `json:"healthy_since"`
+	CleanupError   string `json:"cleanup_error,omitempty"`
+	NodeID         string `json:"node_id"`
+	AppID          string `json:"app_id"`
+	Current        string `json:"current"`
+	DesiredVersion string `json:"desired_version"`
+	DesiredState   string `json:"desired_state"`
+	RunningVersion string `json:"running_version"`
+	RunState       string `json:"run_state"`
+	Health         string `json:"health"`
+	Revision       int64  `json:"revision"`
+	ObservedAt     int64  `json:"observed_at"`
+	Error          string `json:"error"`
+	Config         Config `json:"config"`
 }
 type Installation struct {
 	AppID       string `json:"app_id"`
@@ -159,6 +153,7 @@ type Installation struct {
 	DataEpoch   int64  `json:"data_epoch"`
 	DataBytes   int64  `json:"data_bytes"`
 	InstalledAt int64  `json:"installed_at"`
+	StartedAt   int64  `json:"started_at"`
 }
 type Operation struct {
 	Skipped          bool       `json:"skipped,omitempty"`
@@ -216,10 +211,14 @@ type OperationRequest struct {
 	Start            *bool             `json:"start,omitempty"`
 	Env              map[string]string `json:"env,omitempty"`
 	Health           *Health           `json:"health,omitempty"`
-	AutoRollback     *bool             `json:"auto_rollback,omitempty"`
 	Confirm          bool              `json:"confirm"`
 }
+type Deleted struct {
+	AppID   string `json:"app_id"`
+	Version string `json:"version,omitempty"`
+}
 type Poll struct {
+	Apps          []string          `json:"apps,omitempty"`
 	AgentUpdate   selfupdate.Status `json:"agent_update"`
 	Draining      bool              `json:"draining"`
 	Trial         bool              `json:"trial"`
@@ -240,6 +239,7 @@ type TaskRejection struct {
 	LocalRevision int64  `json:"local_revision"`
 }
 type PollResponse struct {
+	Deleted      []Deleted            `json:"deleted,omitempty"`
 	Update       *selfupdate.Manifest `json:"update,omitempty"`
 	Tasks        []Operation          `json:"tasks"`
 	Acknowledged []string             `json:"acknowledged"`
@@ -283,7 +283,6 @@ type Audit struct {
 func PublicConfig(c Config) Config { c.Env = nil; return c }
 func PublicDeployment(d Deployment) Deployment {
 	d.Config = PublicConfig(d.Config)
-	d.PreviousConfig = PublicConfig(d.PreviousConfig)
 	return d
 }
 func PublicOperation(o Operation) Operation {

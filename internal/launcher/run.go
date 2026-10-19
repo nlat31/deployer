@@ -275,6 +275,7 @@ func (r Runtime) Run() error {
 							trial = false
 							_ = os.Remove(r.file("trial"))
 							_ = os.Remove(r.file("install.json"))
+							_ = os.Remove(r.request())
 							logger.Printf("committed %s", s.Current)
 						}
 					} else {

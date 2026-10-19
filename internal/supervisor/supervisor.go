@@ -43,9 +43,10 @@ func (s Spec) Environment() map[string]string {
 }
 
 type Status struct {
-	Running bool
-	PID     int
-	State   string
+	Running   bool
+	PID       int
+	State     string
+	StartedAt int64
 }
 type Interface interface {
 	Prepare(Spec) error
@@ -61,10 +62,11 @@ type Interface interface {
 type Direct struct{}
 
 type processRecord struct {
-	PID   int    `json:"pid"`
-	Start string `json:"start"`
-	Token string `json:"token"`
-	Boot  string `json:"boot"`
+	PID       int    `json:"pid"`
+	Start     string `json:"start"`
+	Token     string `json:"token"`
+	Boot      string `json:"boot"`
+	StartedAt int64  `json:"started_at"`
 }
 
 func (*Direct) Check(ctx context.Context) error {
@@ -310,7 +312,7 @@ func stopRecord(ctx context.Context, path string) error {
 	}
 }
 func (s *Direct) Quiesce(ctx context.Context, sp Spec) error {
-	for _, name := range []string{"setup.sh", "stop.sh", "clean.sh"} {
+	for _, name := range []string{"setup.sh", "start.sh", "stop.sh", "clean.sh"} {
 		if err := stopRecord(ctx, recordPath(sp, "hook-"+name+"-"+sp.OperationID)); err != nil {
 			return err
 		}
@@ -351,7 +353,7 @@ func launch(cmd *exec.Cmd, path string) (<-chan error, error) {
 		if bootErr != nil {
 			err = bootErr
 		} else {
-			b, _ := json.Marshal(processRecord{PID: cmd.Process.Pid, Start: start, Token: token, Boot: strings.TrimSpace(string(boot))})
+			b, _ := json.Marshal(processRecord{PID: cmd.Process.Pid, Start: start, Token: token, Boot: strings.TrimSpace(string(boot)), StartedAt: model.Now()})
 			err = store.AtomicWrite(path, b, 0600)
 		}
 	}
@@ -369,11 +371,11 @@ func (s *Direct) Hook(ctx context.Context, sp Spec, script string, log func(stri
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if script != "setup.sh" && script != "stop.sh" && script != "clean.sh" {
+	if script != "setup.sh" && script != "start.sh" && script != "stop.sh" && script != "clean.sh" {
 		return fmt.Errorf("不允许的脚本")
 	}
 	limit := 15 * time.Minute
-	if script == "stop.sh" {
+	if script == "stop.sh" || script == "start.sh" {
 		limit = 30 * time.Second
 	}
 	if script == "clean.sh" {
@@ -416,7 +418,11 @@ func (s *Direct) Hook(ctx context.Context, sp Spec, script string, log func(stri
 		return fmt.Errorf("%s 清理失败: %w", script, stopErr)
 	}
 	if err != nil {
-		return fmt.Errorf("%s 执行失败: %w", script, err)
+		text := out.String()
+		if len(text) > 4096 {
+			text = text[len(text)-4096:]
+		}
+		return fmt.Errorf("%s 执行失败: %w: %s", script, err, strings.TrimSpace(text))
 	}
 	return nil
 }
@@ -428,9 +434,6 @@ func (s *Direct) Start(ctx context.Context, sp Spec) error {
 	if err != nil {
 		return err
 	}
-	if st.Running {
-		return nil
-	}
 	if err = s.Prepare(sp); err != nil {
 		return err
 	}
@@ -439,6 +442,22 @@ func (s *Direct) Start(ctx context.Context, sp Spec) error {
 		return err
 	}
 	defer file.Close()
+	// Always invoke start.sh on an explicit start. If an App is already live,
+	// preserve its process record and let the App script implement idempotence.
+	if st.Running {
+		env := map[string]string{}
+		for key, value := range sp.Env {
+			env[key] = value
+		}
+		env["APP_MAIN_PID"] = strconv.Itoa(st.PID)
+		sp.Env = env
+		var writeErr error
+		err := s.Hook(ctx, sp, "start.sh", func(text string) { _, writeErr = io.WriteString(file, text) })
+		if err != nil {
+			return err
+		}
+		return writeErr
+	}
 	cmd := command(sp, "start.sh")
 	cmd.Stdout = file
 	cmd.Stderr = file
@@ -458,7 +477,7 @@ func (s *Direct) Stop(ctx context.Context, sp Spec, log func(string)) error {
 		env["APP_MAIN_PID"] = strconv.Itoa(st.PID)
 		sp.Env = env
 		if err = s.Hook(ctx, sp, "stop.sh", log); err != nil {
-			log(err.Error() + "；继续终止应用进程")
+			return err
 		}
 	}
 	cleanCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -513,7 +532,7 @@ func (*Direct) Status(ctx context.Context, sp Spec) (Status, error) {
 		return Status{}, err
 	}
 	if len(pids) == 0 {
-		return Status{State: "inactive"}, nil
+		return Status{State: "inactive", StartedAt: r.StartedAt}, nil
 	}
 	// A daemonized child still counts as running so stop cannot miss it.
 	pid := pids[0]
@@ -522,7 +541,7 @@ func (*Direct) Status(ctx context.Context, sp Spec) (Status, error) {
 			pid = p
 		}
 	}
-	return Status{Running: true, PID: pid, State: "active"}, nil
+	return Status{Running: true, PID: pid, State: "active", StartedAt: r.StartedAt}, nil
 }
 func (*Direct) Logs(ctx context.Context, sp Spec) (string, error) {
 	if err := ctx.Err(); err != nil {

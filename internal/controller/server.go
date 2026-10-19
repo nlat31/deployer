@@ -62,7 +62,11 @@ func decode(w http.ResponseWriter, r *http.Request, v any) error { return decode
 func decodeLimit(w http.ResponseWriter, r *http.Request, v any, limit int64) error {
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	d := json.NewDecoder(r.Body)
-	d.DisallowUnknownFields()
+	// Heartbeats are extensible within one protocol version so an older Agent
+	// can reconnect and receive its update. Operator requests remain strict.
+	if _, heartbeat := v.(*model.Poll); !heartbeat {
+		d.DisallowUnknownFields()
+	}
 	if e := d.Decode(v); e != nil {
 		return fail(400, "无效请求: "+e.Error())
 	}
@@ -265,11 +269,6 @@ func (s *Server) snapshot(w http.ResponseWriter, r *http.Request) error {
 			inv[n.ID] = v
 		}
 		out["inventories"] = inv
-		deletions, err := store.List[Deletion](t, "deletions")
-		if err != nil {
-			return err
-		}
-		out["deletions"] = deletions
 		if actor(r).Role == "admin" {
 			aud, e := store.Query[model.Audit](t, "audit", store.Filter{Limit: 100})
 			if e != nil {
@@ -308,9 +307,6 @@ func (s *Server) saveApp(w http.ResponseWriter, r *http.Request) error {
 		a.Name = a.ID
 	}
 	e = s.DB.Update(func(t *store.Tx) error {
-		if e := deletionUnlocked(t, a.ID); e != nil {
-			return e
-		}
 		old, e := store.Get[model.App](t, "apps", a.ID)
 		if e == nil {
 			a.CreatedAt = old.CreatedAt
@@ -343,9 +339,6 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) error {
 	}
 	var exists model.Version
 	if e := s.DB.View(func(t *store.Tx) error {
-		if e := deletionUnlocked(t, app); e != nil {
-			return e
-		}
 		if _, e := store.Get[model.App](t, "apps", app); e != nil {
 			return e
 		}
@@ -438,83 +431,99 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) error {
 }
 func (s *Server) recoverImports() error {
 	return s.DB.Update(func(t *store.Tx) error {
-		removedApps := map[string]bool{}
-		vs, e := store.List[model.Version](t, "versions")
-		if e != nil {
-			return e
+		vs, err := store.List[model.Version](t, "versions")
+		if err != nil {
+			return err
 		}
+		retained := map[string]bool{}
+		digests := map[string]bool{}
+		removedApps := map[string]bool{}
 		for _, v := range vs {
+			key := model.Key(v.AppID, v.Version)
+			if v.Status == "deleted" || v.Status == "deleting" || v.Status == "removing_clients" {
+				if err = store.Delete(t, "versions", key); err != nil {
+					return err
+				}
+				removedApps[v.AppID] = true
+				continue
+			}
 			if v.Status == "importing" {
 				d, e := packages.Digest(filepath.Join(s.Root, "archives", v.Digest+".tar.gz"))
 				_, de := os.Stat(filepath.Join(s.Root, "packages", v.AppID, v.Version))
 				if e == nil && de == nil && d == v.Digest {
 					v.Status = "available"
 				} else {
-					os.RemoveAll(filepath.Join(s.Root, "packages", v.AppID, v.Version))
 					v.Status = "failed"
 				}
-				if e = store.Put(t, "versions", model.Key(v.AppID, v.Version), v); e != nil {
-					return e
+				if err = store.Put(t, "versions", key, v); err != nil {
+					return err
 				}
 			}
-			if v.Status == "deleting" {
-				removedApps[v.AppID] = true
-				if e = s.removeArchive(t, v); e != nil {
-					return e
-				}
-				v.Status = "deleted"
-				if e = store.Put(t, "versions", model.Key(v.AppID, v.Version), v); e != nil {
-					return e
-				}
+			if v.Status != "failed" {
+				retained[key] = true
+				digests[v.Digest+".tar.gz"] = true
 			}
 		}
-		jobs, err := store.List[Deletion](t, "deletions")
+		for app := range removedApps {
+			if err = removeEmptyApp(t, app); err != nil {
+				return err
+			}
+		}
+		apps, err := os.ReadDir(filepath.Join(s.Root, "packages"))
 		if err != nil {
 			return err
 		}
-		for _, j := range jobs {
-			if j.State == "cleaned" {
-				j.State = "completed"
-				j.Error = ""
-				if j.Version == "" {
-					if err = store.Delete(t, "apps", j.AppID); err != nil {
+		for _, app := range apps {
+			path := filepath.Join(s.Root, "packages", app.Name())
+			if !app.IsDir() {
+				continue
+			}
+			versions, err := os.ReadDir(path)
+			if err != nil {
+				return err
+			}
+			for _, v := range versions {
+				if !retained[model.Key(app.Name(), v.Name())] {
+					if err = os.RemoveAll(filepath.Join(path, v.Name())); err != nil {
 						return err
 					}
 				}
-				if err = store.Put(t, "deletions", j.ID, j); err != nil {
+			}
+			entries, err := os.ReadDir(path)
+			if err != nil {
+				return err
+			}
+			if len(entries) == 0 {
+				if err = os.Remove(path); err != nil {
 					return err
 				}
 			}
 		}
-		for app := range removedApps {
-			if e = removeEmptyApp(t, app); e != nil {
-				return e
+		archives, err := os.ReadDir(filepath.Join(s.Root, "archives"))
+		if err != nil {
+			return err
+		}
+		for _, a := range archives {
+			if !digests[a.Name()] {
+				if err = os.RemoveAll(filepath.Join(s.Root, "archives", a.Name())); err != nil {
+					return err
+				}
+			}
+		}
+		// Discard legacy deletion records; repository absence now drives cleanup.
+		records, err := store.List[struct {
+			ID string `json:"id"`
+		}](t, "deletions")
+		if err != nil {
+			return err
+		}
+		for _, r := range records {
+			if err = store.Delete(t, "deletions", r.ID); err != nil {
+				return err
 			}
 		}
 		return nil
 	})
-}
-func (s *Server) removeArchive(t *store.Tx, v model.Version) error {
-	if e := os.RemoveAll(filepath.Join(s.Root, "packages", v.AppID, v.Version)); e != nil {
-		return e
-	}
-	vs, e := store.List[model.Version](t, "versions")
-	if e != nil {
-		return e
-	}
-	shared := false
-	for _, x := range vs {
-		if model.Key(x.AppID, x.Version) != model.Key(v.AppID, v.Version) && x.Digest == v.Digest && x.Status != "deleted" && x.Status != "failed" {
-			shared = true
-		}
-	}
-	if !shared {
-		e = os.Remove(filepath.Join(s.Root, "archives", v.Digest+".tar.gz"))
-		if e != nil && !os.IsNotExist(e) {
-			return e
-		}
-	}
-	return nil
 }
 func (s *Server) deleteVersion(w http.ResponseWriter, r *http.Request) error {
 	return s.requestDeletion(w, r, r.PathValue("version"))
@@ -565,11 +574,6 @@ func (s *Server) enqueue(node, app string, req model.OperationRequest, actorID s
 			return e
 		}
 
-		if req.Action != "reconcile" {
-			if e := deletionUnlocked(t, app); e != nil {
-				return e
-			}
-		}
 		n, e := store.Get[model.Node](t, "nodes", node)
 		if e != nil {
 			return e
@@ -587,13 +591,20 @@ func (s *Server) enqueue(node, app string, req model.OperationRequest, actorID s
 			if err != nil {
 				return err
 			}
-			count := 0
+			managed := map[string]bool{}
 			for _, item := range existing {
-				if item.NodeID == node {
-					count++
+				if item.NodeID == node && (item.Current != "" || item.DesiredVersion != "" || item.RunningVersion != "") {
+					managed[item.AppID] = true
 				}
 			}
-			if count >= 256 {
+			items, err := store.Get[[]model.Installation](t, "inventories", node)
+			if err != nil && !errors.Is(err, store.ErrNotFound) {
+				return err
+			}
+			for _, item := range items {
+				managed[item.AppID] = true
+			}
+			if len(managed) >= 256 && !managed[app] {
 				return fail(409, "每台主机最多管理 256 个应用")
 			}
 			d = model.Deployment{NodeID: node, AppID: app, DesiredState: "stopped", RunState: "stopped"}
@@ -613,7 +624,7 @@ func (s *Server) enqueue(node, app string, req model.OperationRequest, actorID s
 			if v.Status != "available" || v.OS != n.OS || v.Arch != n.Arch {
 				return fail(409, "目标版本不可用或平台不匹配")
 			}
-			skip := d.Current == req.Version && req.Version != ""
+			skip := d.Current == req.Version && req.Version != "" && d.Error == "" && d.Health != "unhealthy"
 			if req.Action == "install" {
 				skip = false
 				items, e := store.Get[[]model.Installation](t, "inventories", node)
@@ -643,7 +654,7 @@ func (s *Server) enqueue(node, app string, req model.OperationRequest, actorID s
 		}
 		op = model.Operation{ID: model.ID(), NodeID: node, AppID: app, Action: req.Action, Version: req.Version, IdempotencyKey: req.IdempotencyKey, RequestHash: requestHash, ExpectedRevision: d.Revision, Revision: d.Revision + 1, Stage: "queued", CreatedAt: model.Now(), UpdatedAt: model.Now(), Before: d, Actor: actorID, Config: d.Config, Start: d.DesiredState == "running"}
 		if op.Config.ID == "" {
-			op.Config = model.Config{ID: model.ID(), Health: a.Health, AutoRollback: true}
+			op.Config = model.Config{ID: model.ID(), Health: a.Health}
 		}
 		if req.Health == nil && (req.Action == "deploy" || req.Action == "switch" || req.Action == "install") {
 			op.Config.Health = a.Health
@@ -661,9 +672,7 @@ func (s *Server) enqueue(node, app string, req model.OperationRequest, actorID s
 			op.Config.Health = h
 			op.Config.ID = model.ID()
 		}
-		if req.AutoRollback != nil {
-			op.Config.AutoRollback = *req.AutoRollback
-		}
+
 		if req.Start != nil {
 			op.Start = *req.Start
 		}
@@ -684,21 +693,12 @@ func (s *Server) enqueue(node, app string, req model.OperationRequest, actorID s
 			}
 			op.Version = d.Current
 			op.Start = req.Action != "stop"
-		case "rollback":
-			if d.Previous == "" {
-				return fail(409, "没有保留的回退版本")
-			}
-			op.Version = d.Previous
-			op.Config = d.PreviousConfig
 		case "clean_data", "remove_version":
 			if !req.Confirm {
 				return fail(400, "必须明确确认清理或删除")
 			}
 			if !model.ValidName(op.Version) {
 				return fail(400, "请选择目标版本")
-			}
-			if req.Action == "clean_data" && op.Version == d.Previous {
-				return fail(409, "请先取消回退保留")
 			}
 			if req.Action == "clean_data" && op.Version == d.Current && d.DesiredState != "stopped" {
 				return fail(409, "请先停止当前版本")
@@ -717,11 +717,6 @@ func (s *Server) enqueue(node, app string, req model.OperationRequest, actorID s
 			if !found {
 				return fail(404, "主机未安装此版本")
 			}
-		case "clear_rollback":
-			if !req.Confirm {
-				return fail(400, "请确认取消回退保留")
-			}
-			op.Version = d.Previous
 		case "detach", "reconcile":
 			if !req.Confirm {
 				return fail(400, "请确认解除部署")
@@ -731,7 +726,7 @@ func (s *Server) enqueue(node, app string, req model.OperationRequest, actorID s
 		default:
 			return fail(400, "不支持的操作")
 		}
-		if req.Action == "install" || req.Action == "deploy" || req.Action == "switch" || req.Action == "rollback" || req.Action == "start" || req.Action == "restart" {
+		if req.Action == "install" || req.Action == "deploy" || req.Action == "switch" || req.Action == "start" || req.Action == "restart" {
 			v, e := store.Get[model.Version](t, "versions", model.Key(app, op.Version))
 			if e != nil {
 				return e
@@ -750,7 +745,7 @@ func (s *Server) enqueue(node, app string, req model.OperationRequest, actorID s
 		}
 		d.Revision = op.Revision
 		switch req.Action {
-		case "deploy", "switch", "rollback", "start", "restart":
+		case "deploy", "switch", "start", "restart":
 			d.DesiredVersion = op.Version
 			d.DesiredState = "stopped"
 			if op.Start {
@@ -856,7 +851,7 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request) error {
 	if len(p.AgentUpdate.Version) > 96 || len(p.AgentUpdate.Digest) > 64 || len(p.AgentUpdate.Target) > 64 || len(p.AgentUpdate.Error) > 4096 || len(p.AgentUpdate.Phase) > 32 {
 		return fail(400, "更新状态超限")
 	}
-	if len(p.Events) > 200 || len(p.Operations) > 100 || len(p.Installations) > 10000 || len(p.Deployments) > 256 || len(p.Rejected) > 100 {
+	if len(p.Events) > 200 || len(p.Operations) > 100 || len(p.Apps) > 10000 || len(p.Installations) > 10000 || len(p.Deployments) > 10000 || len(p.Rejected) > 100 {
 		return fail(400, "状态批次超限")
 	}
 	if len(p.Name) > 200 || strings.TrimSpace(p.Name) == "" || p.OS != "linux" || (p.Arch != "amd64" && p.Arch != "arm64") {
@@ -922,7 +917,9 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request) error {
 				return fail(400, "无效部署标识")
 			}
 			old, e := store.Get[model.Deployment](t, "deployments", model.NodeKey(n.ID, d.AppID))
-			if e != nil {
+			if errors.Is(e, store.ErrNotFound) {
+				old = d
+			} else if e != nil {
 				return e
 			}
 			if d.Revision > old.Revision {
@@ -1050,8 +1047,9 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request) error {
 				return e
 			}
 		}
-		if e := s.advanceDeletions(t); e != nil {
-			return e
+		out.Deleted, err = deletedFor(t, p)
+		if err != nil {
+			return err
 		}
 		if e := s.planAgentUpdate(t, n, p, &out); e != nil {
 			return e
@@ -1084,30 +1082,6 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request) error {
 	})
 	if e != nil {
 		return e
-	}
-	s.packagesMu.Lock()
-	cleanupErr := s.recoverImports()
-	s.packagesMu.Unlock()
-	if cleanupErr != nil {
-		log.Printf("仓库清理暂未完成: %v", cleanupErr)
-		// A filesystem cleanup failure must not block heartbeats or result acks.
-		if err := s.DB.Update(func(t *store.Tx) error {
-			jobs, e := store.List[Deletion](t, "deletions")
-			if e != nil {
-				return e
-			}
-			for _, j := range jobs {
-				if j.State == "cleaned" {
-					j.Error = "客户端已清理，仓库清理失败: " + cleanupErr.Error()
-					if e = store.Put(t, "deletions", j.ID, j); e != nil {
-						return e
-					}
-				}
-			}
-			return nil
-		}); err != nil {
-			log.Printf("记录仓库清理错误: %v", err)
-		}
 	}
 	if len(out.Tasks) == 0 {
 		select {

@@ -4,6 +4,7 @@ import (
 	"deployer/internal/model"
 	"deployer/internal/store"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -167,8 +168,8 @@ func TestDeleteAppAndLastVersionRemoveCards(t *testing.T) {
 					t.Fatal("deleted card remains", e)
 				}
 				v, e := store.Get[model.Version](tx, "versions", "a/1")
-				if e != nil || v.Status != "deleted" {
-					t.Fatal("version not deleted", e)
+				if !errors.Is(e, store.ErrNotFound) {
+					t.Fatal("version not deleted", v, e)
 				}
 				_, e = store.Get[model.App](tx, "apps", "other")
 				return e
@@ -189,20 +190,56 @@ func TestDeleteAppAndLastVersionRemoveCards(t *testing.T) {
 		})
 	}
 }
-func TestDeleteReferencedAppQueuesCleanup(t *testing.T) {
+func TestFailedCurrentVersionCanBeDeployedAgain(t *testing.T) {
 	s := newAuthServer(t, t.TempDir())
 	defer s.Close()
 	seedListDeploy(t, s)
-	b := &authBrowser{t: t, s: s}
-	b.login(DefaultAdminPassword, 200)
-	b.call("DELETE", "/apps/a?confirm=true", nil, 202)
-	if e := s.DB.View(func(tx *store.Tx) error {
-		v, e := store.Get[model.Version](tx, "versions", "a/1")
-		if e == nil && v.Status != "removing_clients" {
-			t.Fatal("deletion did not retain package pending cleanup")
+	if err := s.DB.Update(func(tx *store.Tx) error {
+		d, err := store.Get[model.Deployment](tx, "deployments", model.NodeKey("n1", "a"))
+		if err != nil {
+			return err
 		}
-		return e
-	}); e != nil {
-		t.Fatal(e)
+		d.Health = "unhealthy"
+		d.Error = "component checksum mismatch"
+		return store.Put(tx, "deployments", model.NodeKey("n1", "a"), d)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var op model.Operation
+	err := s.enqueue("n1", "a", model.OperationRequest{Action: "deploy", Version: "1", ExpectedRevision: 7, IdempotencyKey: "retry-failed", SkipIfDeployed: true}, "admin", &op)
+	if err != nil || op.Skipped || op.Terminal() || op.Revision != 8 {
+		t.Fatal("failed target was silently skipped", op, err)
+	}
+}
+
+func TestDeletedAppTombstonesDoNotExhaustNodeLimit(t *testing.T) {
+	s := newAuthServer(t, t.TempDir())
+	defer s.Close()
+	seedListDeploy(t, s)
+	if err := s.DB.Update(func(tx *store.Tx) error {
+		for i := 0; i < 256; i++ {
+			id := fmt.Sprintf("deleted-%d", i)
+			if err := store.Put(tx, "deployments", model.NodeKey("n2", id), model.Deployment{NodeID: "n2", AppID: id, RunState: "stopped"}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var op model.Operation
+	if err := s.enqueue("n2", "a", model.OperationRequest{Action: "deploy", Version: "1", IdempotencyKey: "new-app"}, "admin", &op); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestAppRollbackActionsAreRejected(t *testing.T) {
+	s := newAuthServer(t, t.TempDir())
+	defer s.Close()
+	seedListDeploy(t, s)
+	for _, action := range []string{"rollback", "clear_rollback"} {
+		var op model.Operation
+		if err := s.enqueue("n1", "a", model.OperationRequest{Action: action, ExpectedRevision: 7, IdempotencyKey: action}, "admin", &op); err == nil {
+			t.Fatalf("accepted removed action %s", action)
+		}
 	}
 }

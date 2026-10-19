@@ -44,13 +44,6 @@ func (s *Server) recoverRestoredNode(t *store.Tx, n model.Node, p model.Poll) (b
 		if !first && err == nil && d.Revision <= old.Revision {
 			continue
 		}
-		if _, err = store.Get[model.App](t, "apps", d.AppID); errors.Is(err, store.ErrNotFound) {
-			if err = store.Put(t, "apps", d.AppID, model.App{ID: d.AppID, Name: d.AppID, Health: d.Config.Health}); err != nil {
-				return false, err
-			}
-		} else if err != nil {
-			return false, err
-		}
 		d.NodeID = n.ID
 		d.ObservedAt = model.Now()
 		d.Error = "控制端已从备份恢复，请停止并解除阻塞后重新部署"

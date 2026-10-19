@@ -163,6 +163,13 @@ func (r Runtime) Install(source string) error {
 	if e != nil {
 		return e
 	}
+	// An explicit package installation supersedes already downloaded automatic
+	// requests; otherwise a completed older release can be replayed afterwards.
+	for _, path := range []string{r.request(), filepath.Join(r.Root, "updater", r.Role+"-download.json")} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
 	s, e := r.load()
 	if os.IsNotExist(e) {
 		s = State{Current: d, Phase: "committed"}

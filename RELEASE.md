@@ -4,6 +4,17 @@
 
 ## 四个入口
 
+控制端发行包直接包含 `setup.sh`、`start.sh`、`stop.sh`、`remove.sh` 和三个程序，无外层版本目录。可解压到 `/data/deployer` 后，在该目录运行这些脚本；`setup.sh` 安装但不会启动服务。Agent 包仍保留外层版本目录。
+
+```bash
+sudo mkdir -p /data/deployer
+sudo tar -xzf deployer-server-0.2.0-linux-amd64.tar.gz -C /data/deployer
+cd /data/deployer
+sudo ./setup.sh
+sudo ./start.sh
+# 需要停止时：sudo ./stop.sh
+```
+
 ```bash
 ./release-server.sh 1.0.0
 ./release-agent.sh 1.0.0
@@ -120,6 +131,8 @@ GOCACHE="$PWD/.cache/go-build" go test -race ./...
 GOCACHE="$PWD/.cache/go-build" go vet ./...
 # Linux 用户命名空间中的 root；只访问临时安装目录
 unshare -Ur python3 scripts/test-lifecycle.py
+# 验证公网控制端包的根目录脚本与真实服务重复安装/启动/停止/移除
+sudo python3 scripts/test-server-package.py dist/deployer-server-0.2.0-linux-amd64.tar.gz
 # 真实签名更新和失败回退，包含完整 60 秒试运行
 unshare -Ur python3 scripts/test-auto-update.py
 # 真实 root 应用执行器测试（主机允许 user namespaces 时）
@@ -138,3 +151,32 @@ npm test
 ```
 
 浏览器测试使用隔离的接口样本，覆盖 multipart 上传、平台筛选、批量更新、暂停、失败提示、只读权限及删除确认取消。Go 集成测试通过真实 mTLS 服务与两台 Agent 验证删除任务、目录清理和回报；Direct supervisor 测试验证真实进程先停止后删除。
+
+
+## 应用健康检查
+
+HTTP 健康检查只使用 HTTP 状态码：2xx 表示正常，非 2xx、请求失败或主进程退出表示探测失败，响应正文中的错误消息会显示在后台部署记录中。Deployer 不解析 `ready`、初始化阶段、下载量或进度标记，也不识别“无进展”。应用负责在实际故障时从健康接口返回非 2xx 和具体错误原因；正常下载、校验和初始化应返回 2xx。
+
+启动后，健康接口在配置的稳定期内持续成功即可提交部署；此时应用可以仍在初始化。`timeout_seconds` 仅用于启动健康检查的等待上限，稳定期保留。它不限制应用内部下载或初始化总时长。应用后续发生故障，由自身健康接口报告，Agent 仅上报健康状态和错误消息，不自动回退、停止或重启 App。管理员在后台手动切换版本或启停。
+
+Loom Worker 的 `/healthz` 和 `/readyz` 正常初始化均返回 HTTP 200、`healthy:true`、`ready:false`、空 `error`；`ready` 仅供查看业务准备情况。真实组件错误或主控连接错误返回 HTTP 503 和具体原因。无需新的 Deployer Agent 健康响应协议，已经上传的旧 Worker 包仍需更新才具备该行为。
+
+
+## App 失败处理
+
+App 不提供自动回退选项。准备阶段失败时旧版本继续运行；旧版本停止、新版本已尝试启动后发生失败，记录选中的目标版本、实际进程状态及错误，保留版本目录，等待管理员手动切换。健康检查失败不会停止仍在运行的目标进程，也不会重启旧版本。无法确认旧进程已停止时不启动目标版本，标记需要管理员核对；中断操作的恢复同样只核对和上报，不隐式切回旧版本。
+
+运行期间健康接口的非 2xx 响应正文随 Agent 心跳传至后台设备列表；应用恢复正常后清除当前健康错误，历史任务失败原因保留。App 进程退出同样只上报，由管理员手动启动或切换。主机或 Agent 重启后只核对并上报 App 状态，不按旧的 running 意图自动启动 App，需管理员明确下发启动命令；Agent 自身的签名自动更新、试运行和失败回退不受 App 策略影响。
+
+
+启动命令总会执行 App 的 start.sh，重复调用是否幂等由 App 自己负责。已有受管进程时，Deployer 注入 APP_MAIN_PID 并保留原进程记录，等待脚本返回；不会替 App 先停止再启动。Loom Worker 已在自己的 start.sh 实现重复启动处理。Agent 心跳允许同一协议中的未知可选字段，确保旧客户端带已删除的 auto_rollback 状态仍能连接并领取更新；管理员操作接口仍严格拒绝该已删除选项。
+
+## 待发布：版本部署与启动时间
+
+心跳版本清单新增 `started_at`，从持久化 App 进程记录读取最近实际启动时间。已有 `installed_at` 调整为包校验落盘后填写，避免失败下载提前报告部署时间。设备列表和版本管理展示两个时间及实际运行版本。两个字段都是客户端事件时间，不使用控制端收到心跳的时间替代；旧记录缺少启动时间时保留未知。
+
+需要更新控制端页面及 Agent 后才具备完整展示和采集能力。本项已随 0.2.4 公网发行包交付。测试覆盖完整版本清单的 mTLS 心跳存储、下载失败、重复安装/启动、停止后保留、重新启动刷新、版本切换隔离及 Agent 重启接管。
+
+### 0.2.4 设备列表与心跳目录同步
+
+移除“应用部署”页面和 App 回退动作/引用。设备列表必须选择 App 或未部署，提供版本切换、启停、日志、版本及时间查看。仓库删除立即生效；Agent 心跳接收 deleted 并先停再删，不建立删除任务或标记。停止失败的目录保留，cleanup_error 在设备列表展示，后续心跳重试。发布需同时更新控制端和 Agent；历史未采集的启动时间仍显示未记录。

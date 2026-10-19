@@ -1,6 +1,6 @@
 # 公网正式发布与控制台验收（2026-10-19）
 
-目标地址：18.138.124.233，SSH 别名 loom。正式版本为 Loom 0.8.14、Deployer 0.2.0，Linux amd64。
+目标地址：18.138.124.233，SSH 别名 loom，Linux amd64。当前服务端发布为 Loom 0.8.16、Deployer 0.2.4；前文各节保留此前发布与清空操作的历史记录，最新现场结果见文末。
 
 ## 已通过的现场验收
 
@@ -44,3 +44,55 @@ Loom dist 包含正式服务端、工具依赖包，以及独立/Deployer 托管
 本次数据库压缩备份期间，控制端停机超过旧 Worker 的健康窗口，该 Worker 曾由既有健康恢复策略重启；这与此前 rc.4 批量更新/失败回退期间保持业务进程身份不变的验收是不同阶段。正式 Agent 更新时，运行中的 Worker 进程早于该 Agent 的试运行；最后已按旧版本清理要求停止并移除。
 
 最终机器证据：final-local.json、final-public.json、formal-ui-report.json、remote-deployment.json、remote-cleanup.json、formal-packages.json。截图 formal-worker-ready.png 展示正式版本已入库；live-failure-reason.png 展示真实崩溃候选的控制台失败原因。
+
+## 同版本控制端重打包与手动部署准备（后续操作）
+
+按用户要求重新构建 Deployer 控制端 0.2.0，包改为直接包含 setup.sh、start.sh、stop.sh、remove.sh 和三个程序的平铺结构；版本号不变。SHA-256 为 `365d755887bc0e0a078040c814c6e7ea3a03b64f4a4ec5b02bf692904e179270`，覆盖服务器 `/data/releases/formal-20261019/deployer-server-0.2.0-linux-amd64.tar.gz`。
+
+真实 root 隔离验证已通过：包成员和执行权限、脚本语法、版本号、重复 setup/start/stop/remove、重复启动保持原进程、HTTP 就绪及卸载保留数据。
+
+当前状态已取代前述验收结束时的 Deployer 状态：服务器控制端已停止并移除旧安装程序，活动数据目录 `/data/deployer/controller` 已清空，原应用、发布、节点、用户及更新批次等数据不再保留于活动目录。证书及配置保留，历史备份未删除。根目录 `/data/deployer` 已放好新程序和脚本，但未执行 setup/start，留给用户手动部署。Loom 就绪检查仍通过，本机 Agent 未改动。
+
+服务器执行：`cd /data/deployer`，然后 `sudo ./setup.sh`、`sudo ./start.sh`；停止执行 `sudo ./stop.sh`。现场证据为远端 `/data/releases/formal-20261019/manual-server-reset.json`，本地测试日志为 `.cache/console-public-20261019/repack-test.log`。
+
+## 简化 App 生命周期后的发布与现场验收
+
+最新实际运行版本为 Loom 服务端/Worker **0.8.16**、Deployer 服务端/Agent **0.2.3**。两个服务端已部署到 ssh loom 并以 root 启动；148.135.91.253、148.135.97.51 的签名 Agent 更新均已提交，两个受管 Worker 最终均为 root、HTTP 200、healthy=true、ready=true。最后一台 Agent 完成五分钟稳定观察后，更新批次已暂停。
+
+本轮保留操作开始时的现有数据：26 条 Loom 任务、8 条组件记录，以及 Deployer 的两台节点、一项应用、原数据库文件、配置和证书。备份位于服务器 `/data/backups/manual-final-20261019`；launcher 修复前另有 `/data/backups/deployer-before-launcher-fix`。没有清空数据库。
+
+职责边界保持简单：Deployer 执行管理员明确请求的部署、setup、启停和版本切换，反馈实际状态与错误。每次 start 都调用 App 的 start.sh，重复启动由 App 脚本自行处理；HTTP 2xx 即正常，不解析 ready、下载进度或“无进展”。App 失败不自动停止、重启或回退；Agent 重启也只核对 App 状态。Agent 自身签名更新仍有独立的试运行和失败回退。
+
+真实公网验收已通过：
+
+- 两台客户端 install/setup、重复 install，以及两节点批量部署。精简 Worker 冷下载期间返回 HTTP 200，部署成功，之后扫描/识别/采集组件全部就绪。
+- 重复 stop/start；重复 start 确实进入 App 脚本并输出“工作端已运行”，原 PID 不变，私钥和版本数据保留。
+- 管理员手动从 0.8.16 切到保留的 0.8.14，再切回 0.8.16；旧版本进程退出，版本私钥不变。
+- 启动 exit 43 的临时坏版本后，目标版本保持失败，没有自动回退或重启；再通过真实控制台手动切回 0.8.16 成功。
+- 故意损坏组件缓存，Worker 返回 HTTP 503 和 `component cache corrupted: adapter.lua`，后台收到相同错误正文；Worker 与 Agent PID 均未变化。恢复文件后，当前健康错误清除。
+- SIGKILL Worker 后，后台报告“主进程未运行”，应用保持停止；重启 Agent 后仍保持停止。明确下发 start 才恢复就绪。
+- 坏版本删除任务完成且客户端目录消失；两项临时坏版本均已删除，审计删除记录保留。临时组件故障、下载暂存文件及本地临时 SSH 密码文件已清理。
+
+本轮发现并修复两项更新问题：旧 Agent 心跳携带已删除字段时无法领取更新；手动 setup 后遗留的旧更新请求可能再次切回旧 Agent。前者仅放宽同协议 Agent 心跳的可选字段解析，管理员操作仍严格校验；后者在安装和提交时清理已被替代的更新请求，并补充回归测试。
+
+最终全量 `go test -race ./...`、go vet、前端生产构建和四项浏览器交互测试通过。最终 0.2.3 控制端发行包在随机临时目录完成真实 root 的四脚本重复执行测试，卸载保留数据；Loom 正式构建执行全量 Go、组件、发行及主控脚本测试。五项最终发行归档的 SHA-256 已重新核对。
+
+证据位于 `.cache/manual-release-20261019/`：`acceptance.json` 包含 17 项现场检查与操作记录；`final-clients.json`、`server-final.json` 为最终进程及健康状态；`deployment-final.json` 为数据保留核对；`agent-update.json` 和 `agent-rollout-final.json` 为签名更新结果；`packages.json` 为最终包校验；`final-regression-after-fix.log`、`package-test-final.log` 为最终测试日志。截图为 `manual-switch.png`、`final-console.png`。删除检查按 `status=deleted` 和客户端目录确认，删除记录不会从审计清单消失。
+
+本轮是实际公网功能与故障验收，不能替代长期浸泡测试或主机级高可用验证。
+
+## 设备列表与心跳删除同步发布（2026-10-20）
+
+Deployer 0.2.4 公网版已部署至 `ssh loom`（18.138.124.233），两台 Agent（148.135.91.253、148.135.97.51）通过签名批次升级到 0.2.4，完成试运行及稳定观察，均以 root 运行。原控制端数据库原地保留，原有 App/可用版本记录保留。两个现有 Loom Worker 0.8.16 的 PID、业务私钥摘要和健康状态保持不变。
+
+- 设备列表必须先筛选 App 或“未部署”。未部署设备仅可部署；App 设备提供切换版本、停止、启动、日志、版本管理。分页选择跨页保留，改变筛选清空选择。独立“应用部署”页面移除。
+- App 的 previous/previous_config、rollback/clear_rollback 操作及对应限制移除。管理员显式选择版本；不自动重启、停止或切回旧 App 版本。Agent 自身签名更新机制保留。
+- 仓库删除立即移除记录和源包，不登记删除任务或待删除标记。心跳根据本地安装及实际目录与仓库的差异返回 `deleted`。客户端先停止并核验退出，再删除版本或整个 App 目录。失败时保留目录、通过 `cleanup_error` 反馈原因，后续心跳重试；离线设备重连后清理。
+- 修复真实 stop.sh 错误被吞掉的问题：脚本失败返回退出码和错误输出，不再继续强制终止进程或删除目录。
+- 心跳及设备版本管理包含部署时间和最近实际启动时间；旧进程没有采集到的启动时间仍显示未记录。
+
+验证：完整 root `go test -race ./...`、`go vet ./...`、前端构建、11 项浏览器测试及最终服务端归档的四脚本幂等测试通过。公网使用临时 `device-cleanup-probe` 完成两机批量部署/setup、安装第二版本、真实控制台版本切换、启停、重复启动、日志、版本时间展示。运行中的版本删除时注入 stop.sh 错误，确认错误上报且目录保留；解除故障后心跳自动完成清理。整个 App 删除时暂停第二台 Agent，确认仓库立即消失、在线设备先停再删，离线设备重连后整个目录消失。两种仓库删除均未新增操作任务。临时 App、版本和两机目录均已清除。
+
+发行包：`dist/deployer-server-0.2.4-linux-amd64.tar.gz`、`dist/deployer-agent-0.2.4-linux-amd64.tar.gz`；签名 Agent binary/manifest 同目录。远端归档位于 `/data/releases/device-console-20261019/`。控制端原数据备份位于 `/data/backups/deployer-before-device-console-0.2.4/`。
+
+证据：[现场验收](.cache/device-console-20261019/acceptance.json)、[最终版本与数据核对](.cache/device-console-20261019/final.json)、[Go race](.cache/device-console-20261019/race-tests.log)、[浏览器测试](.cache/device-console-20261019/web-tests.log)、[跨页筛选测试](.cache/device-console-20261019/web-pagination-test.log)、[归档四脚本测试](.cache/device-console-20261019/package-test.log)。

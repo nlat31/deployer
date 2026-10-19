@@ -267,6 +267,33 @@ func (c *Client) poll(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Include actual directories, including interrupted installs with no DB entry.
+	entries, err := os.ReadDir(filepath.Join(c.Root, "apps"))
+	if err != nil {
+		return err
+	}
+	known := map[string]bool{}
+	for _, i := range p.Installations {
+		known[model.Key(i.AppID, i.Version)] = true
+	}
+	for _, app := range entries {
+		if !model.ValidName(app.Name()) {
+			continue
+		}
+		p.Apps = append(p.Apps, app.Name())
+		if !app.IsDir() {
+			continue
+		}
+		versions, err := os.ReadDir(filepath.Join(c.Root, "apps", app.Name(), "versions"))
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		for _, v := range versions {
+			if model.ValidName(v.Name()) && !known[model.Key(app.Name(), v.Name())] {
+				p.Installations = append(p.Installations, model.Installation{AppID: app.Name(), Version: v.Name()})
+			}
+		}
+	}
 	var response model.PollResponse
 	if err = c.request(ctx, "/agent/poll", p, &response); err != nil {
 		return err
@@ -319,6 +346,22 @@ func (c *Client) poll(ctx context.Context) error {
 	c.scheduleUpdate(ctx, response.Update)
 	if launcher.Draining() || launcher.Trial() {
 		return nil
+	}
+	if len(response.Deleted) > 0 {
+		if _, loaded := c.running.LoadOrStore("repository-cleanup", true); !loaded {
+			c.gate.RLock()
+			c.workers.Add(1)
+			go func() {
+				defer c.workers.Done()
+				defer c.gate.RUnlock()
+				defer c.running.Delete("repository-cleanup")
+				for _, item := range response.Deleted {
+					if err := c.Engine.SyncDeleted(ctx, item); err != nil {
+						log.Printf("仓库同步清理 %s/%s: %v", item.AppID, item.Version, err)
+					}
+				}
+			}()
+		}
 	}
 	for _, task := range response.Tasks {
 		if _, loaded := c.running.LoadOrStore(task.ID, true); loaded {

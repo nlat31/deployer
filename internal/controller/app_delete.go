@@ -6,26 +6,17 @@ import (
 	"net/http"
 )
 
-// Keep version tombstones for immutable package names, but remove the empty
-// application itself so it cannot remain as a ghost card after its last delete.
 func removeEmptyApp(t *store.Tx, app string) error {
-	versions, e := store.List[model.Version](t, "versions")
-	if e != nil {
-		return e
+	versions, err := store.List[model.Version](t, "versions")
+	if err != nil {
+		return err
 	}
-	found := false
 	for _, v := range versions {
 		if v.AppID == app {
-			found = true
-			if v.Status != "deleted" {
-				return nil
-			}
+			return nil
 		}
 	}
-	if found {
-		return store.Delete(t, "apps", app)
-	}
-	return nil
+	return store.Delete(t, "apps", app)
 }
 func (s *Server) deleteApp(w http.ResponseWriter, r *http.Request) error {
 	return s.requestDeletion(w, r, "")

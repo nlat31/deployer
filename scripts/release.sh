@@ -35,7 +35,12 @@ if [[ "$role" == agent && -n "${DEPLOYER_UPDATE_SIGNING_KEY:-}" ]]; then
   install -m 0700 "$package/deployer-agent" "dist/$name.bin"
 fi
 python3 scripts/package-lifecycle.py "$role" "$arch" "$version" "$package"
-tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner -cf - -C "$stage" "$name" | gzip -n > "$stage/$name.tar.gz"
+if [[ "$role" == server ]]; then
+  # Extract directly into the operator's chosen directory, with ./setup.sh ready.
+  tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner -cf - -C "$package" "${binaries[@]}" setup.sh start.sh stop.sh remove.sh | gzip -n > "$stage/$name.tar.gz"
+else
+  tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner -cf - -C "$stage" "$name" | gzip -n > "$stage/$name.tar.gz"
+fi
 mv -- "$stage/$name.tar.gz" "dist/$name.tar.gz"
 (cd dist; sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 printf 'Release: %s/dist/%s.tar.gz\n' "$PWD" "$name"
