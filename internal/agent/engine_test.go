@@ -276,17 +276,17 @@ func TestCleanDeduplicationAndProtectedDeletion(t *testing.T) {
 	if _, e := os.Stat(filepath.Join(h.e.Root, "apps", "sample", "versions", a.Version, "data", "seed")); e != nil {
 		t.Fatal("stale clean deleted new data")
 	}
-	if o := h.run(h.op("remove_version", a.Version, nil)); o.Result != "failed" {
-		t.Fatal("deleted current version")
-	}
-	h.run(h.op("detach", a.Version, nil))
-	if o := h.run(h.op("remove_version", a.Version, nil)); o.Result != "failed" {
-		t.Fatal("deleted nonempty data")
-	}
-	h.run(h.op("clean_data", a.Version, nil))
 	if o := h.run(h.op("remove_version", a.Version, nil)); o.Result != "succeeded" {
 		t.Fatal(o)
 	}
+	if _, err := os.Stat(filepath.Join(h.e.Root, "apps/sample")); !os.IsNotExist(err) {
+		t.Fatal("removed application directory remains", err)
+	}
+	// Repeated deletion is safe even after all files and inventory disappeared.
+	if o := h.run(h.op("remove_version", a.Version, nil)); o.Result != "succeeded" {
+		t.Fatal(o)
+	}
+
 }
 func TestRecoveryAfterStartBeforeCommit(t *testing.T) {
 	h := newHarness(t)

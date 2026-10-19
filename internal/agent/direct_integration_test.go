@@ -148,3 +148,28 @@ func TestDirectEngineDeploySwitchRecoverStopClean(t *testing.T) {
 		t.Fatal("setup did not run after clean", err)
 	}
 }
+
+func TestDirectPurgeRunningAppRemovesProcessAndDirectory(t *testing.T) {
+	h := newHarness(t)
+	sup := &supervisor.Direct{}
+	h.e.Supervisor = sup
+	v := realVersion(t, h, "1", false)
+	sp := supervisor.Spec{Root: h.e.Root, AppID: "sample", Version: "1", OperationID: model.ID()}
+	t.Cleanup(func() { _ = sup.Stop(context.Background(), sp, func(string) {}) })
+	if o := h.run(h.op("deploy", "1", &v)); o.Result != "succeeded" {
+		t.Fatal(o)
+	}
+	before, err := sup.Status(context.Background(), sp)
+	if err != nil || !before.Running {
+		t.Fatal(before, err)
+	}
+	if o := h.run(h.op("purge_app", "", nil)); o.Result != "succeeded" {
+		t.Fatal(o)
+	}
+	if err := syscall.Kill(before.PID, 0); err == nil {
+		t.Fatal("deleted live process directory")
+	}
+	if _, err := os.Stat(filepath.Join(h.e.Root, "apps/sample")); !os.IsNotExist(err) {
+		t.Fatal("app remains", err)
+	}
+}

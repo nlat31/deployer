@@ -53,6 +53,14 @@ func TestAgentReleaseAndSequentialRollout(t *testing.T) {
 	if e = upload([]byte("test agent")); e != nil {
 		t.Fatal("idempotent upload", e)
 	}
+	listed := httptest.NewRecorder()
+	if e = s.agentReleases(listed, httptest.NewRequest("GET", "/api/agent-releases", nil)); e != nil {
+		t.Fatal(e)
+	}
+	var releases []selfupdate.Manifest
+	if e = json.Unmarshal(listed.Body.Bytes(), &releases); e != nil || len(releases) != 1 || releases[0].Digest != digest {
+		t.Fatal("release list", listed.Body.String(), e)
+	}
 	roll := AgentRollout{Digest: digest, Nodes: []string{"n1", "n2"}}
 	if e = s.DB.Update(func(tx *store.Tx) error { return store.Put(tx, "settings", "agent_rollout", roll) }); e != nil {
 		t.Fatal(e)

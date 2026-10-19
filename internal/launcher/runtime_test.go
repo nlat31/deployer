@@ -121,6 +121,24 @@ func TestUpgradeCommitAndStop(t *testing.T) {
 		t.Fatal("child survived stop")
 	}
 }
+
+func TestInstallCurrentAfterRollbackIsNoOp(t *testing.T) {
+	r, old, bad := fixture(t)
+	state := State{Current: old, Previous: old, Target: bad, Phase: "failed", Failed: []string{bad}, Error: "trial failed"}
+	if err := r.save(state); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Install(r.Binary(old)); err != nil {
+		t.Fatal(err)
+	}
+	next, err := r.load()
+	if err != nil || next.Phase != "failed" || next.Current != old || next.Target != bad || next.Error != state.Error {
+		t.Fatalf("reinstall changed rollback state: %+v, %v", next, err)
+	}
+	if _, err := os.Stat(r.file("install.json")); !os.IsNotExist(err) {
+		t.Fatalf("unexpected update request: %v", err)
+	}
+}
 func TestTrialFailuresRollback(t *testing.T) {
 	for _, mode := range []byte{'B', 'H', 'O'} {
 		t.Run(string(mode), func(t *testing.T) {

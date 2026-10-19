@@ -32,3 +32,7 @@ coverage.html
 # Local env overrides (tracked examples stay under configs/)
 .env
 !.env.example
+
+# Browser test artifacts
+/web/test-results/
+/web/playwright-report/

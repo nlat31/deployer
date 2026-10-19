@@ -177,7 +177,7 @@ func (r Runtime) Install(source string) error {
 	if s.Phase == "removing" {
 		return fmt.Errorf("finish remove.sh before reinstalling")
 	}
-	if s.Current == d && s.Phase == "committed" {
+	if s.Current == d && (s.Phase == "committed" || s.Phase == "failed") {
 		return r.link(d)
 	}
 	if r.alive("launcher.json") {

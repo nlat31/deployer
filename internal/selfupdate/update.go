@@ -21,7 +21,7 @@ const Format = 1
 // Compatibility is deliberately exact. Bump when rollback cannot read state.
 const Compatibility = "protocol3-state3-process1"
 
-var Version = "dev"
+var Version = "0.2.0"
 var Commit = "unknown"
 
 type Manifest struct {

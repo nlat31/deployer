@@ -133,6 +133,7 @@ func New(root string, secure bool, ui http.Handler) (*Server, error) {
 	s.mux.HandleFunc("POST /api/users", s.authorize("admin", s.saveUser))
 	s.mux.HandleFunc("GET /api/users", s.authorize("admin", s.users))
 	s.mux.HandleFunc("POST /enroll", s.wrap(s.enroll))
+	s.mux.HandleFunc("GET /api/agent-releases", s.authorize("viewer", s.agentReleases))
 	s.mux.HandleFunc("POST /api/agent-releases", s.authorize("admin", s.uploadAgentRelease))
 	s.mux.HandleFunc("GET /api/agent-rollout", s.authorize("viewer", s.agentRollout))
 	s.mux.HandleFunc("POST /api/agent-rollout", s.authorize("admin", s.setAgentRollout))
@@ -264,6 +265,11 @@ func (s *Server) snapshot(w http.ResponseWriter, r *http.Request) error {
 			inv[n.ID] = v
 		}
 		out["inventories"] = inv
+		deletions, err := store.List[Deletion](t, "deletions")
+		if err != nil {
+			return err
+		}
+		out["deletions"] = deletions
 		if actor(r).Role == "admin" {
 			aud, e := store.Query[model.Audit](t, "audit", store.Filter{Limit: 100})
 			if e != nil {
@@ -302,6 +308,9 @@ func (s *Server) saveApp(w http.ResponseWriter, r *http.Request) error {
 		a.Name = a.ID
 	}
 	e = s.DB.Update(func(t *store.Tx) error {
+		if e := deletionUnlocked(t, a.ID); e != nil {
+			return e
+		}
 		old, e := store.Get[model.App](t, "apps", a.ID)
 		if e == nil {
 			a.CreatedAt = old.CreatedAt
@@ -334,6 +343,9 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) error {
 	}
 	var exists model.Version
 	if e := s.DB.View(func(t *store.Tx) error {
+		if e := deletionUnlocked(t, app); e != nil {
+			return e
+		}
 		if _, e := store.Get[model.App](t, "apps", app); e != nil {
 			return e
 		}
@@ -456,6 +468,24 @@ func (s *Server) recoverImports() error {
 				}
 			}
 		}
+		jobs, err := store.List[Deletion](t, "deletions")
+		if err != nil {
+			return err
+		}
+		for _, j := range jobs {
+			if j.State == "cleaned" {
+				j.State = "completed"
+				j.Error = ""
+				if j.Version == "" {
+					if err = store.Delete(t, "apps", j.AppID); err != nil {
+						return err
+					}
+				}
+				if err = store.Put(t, "deletions", j.ID, j); err != nil {
+					return err
+				}
+			}
+		}
 		for app := range removedApps {
 			if e = removeEmptyApp(t, app); e != nil {
 				return e
@@ -487,49 +517,7 @@ func (s *Server) removeArchive(t *store.Tx, v model.Version) error {
 	return nil
 }
 func (s *Server) deleteVersion(w http.ResponseWriter, r *http.Request) error {
-	if r.URL.Query().Get("confirm") != "true" {
-		return fail(400, "必须确认删除仓库包")
-	}
-	app, ver := r.PathValue("app"), r.PathValue("version")
-	if !model.ValidName(app) || !model.ValidName(ver) {
-		return fail(400, "非法标识")
-	}
-	s.packagesMu.Lock()
-	defer s.packagesMu.Unlock()
-	var v model.Version
-	e := s.DB.Update(func(t *store.Tx) error {
-		var e error
-		v, e = store.Get[model.Version](t, "versions", model.Key(app, ver))
-		if e != nil {
-			return e
-		}
-		if e = versionUnreferenced(t, app, ver); e != nil {
-			return e
-		}
-		v.Status = "deleting"
-		return store.Put(t, "versions", model.Key(app, ver), v)
-	})
-	if e != nil {
-		return e
-	}
-	e = s.DB.Update(func(t *store.Tx) error {
-		if e := s.removeArchive(t, v); e != nil {
-			return e
-		}
-		v.Status = "deleted"
-		if e := store.Put(t, "versions", model.Key(app, ver), v); e != nil {
-			return e
-		}
-		if e := removeEmptyApp(t, app); e != nil {
-			return e
-		}
-		return audit(t, actor(r).ID, "delete_package", model.Key(app, ver))
-	})
-	if e != nil {
-		return e
-	}
-	jsonOut(w, 200, v)
-	return nil
+	return s.requestDeletion(w, r, r.PathValue("version"))
 }
 
 func (s *Server) createOperation(w http.ResponseWriter, r *http.Request) error {
@@ -577,6 +565,11 @@ func (s *Server) enqueue(node, app string, req model.OperationRequest, actorID s
 			return e
 		}
 
+		if req.Action != "reconcile" {
+			if e := deletionUnlocked(t, app); e != nil {
+				return e
+			}
+		}
 		n, e := store.Get[model.Node](t, "nodes", node)
 		if e != nil {
 			return e
@@ -704,13 +697,10 @@ func (s *Server) enqueue(node, app string, req model.OperationRequest, actorID s
 			if !model.ValidName(op.Version) {
 				return fail(400, "请选择目标版本")
 			}
-			if op.Version == d.Previous {
+			if req.Action == "clean_data" && op.Version == d.Previous {
 				return fail(409, "请先取消回退保留")
 			}
-			if req.Action == "remove_version" && op.Version == d.Current {
-				return fail(409, "不能删除当前版本")
-			}
-			if op.Version == d.Current && d.DesiredState != "stopped" {
+			if req.Action == "clean_data" && op.Version == d.Current && d.DesiredState != "stopped" {
 				return fail(409, "请先停止当前版本")
 			}
 			is, e := store.Get[[]model.Installation](t, "inventories", node)
@@ -1060,6 +1050,9 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request) error {
 				return e
 			}
 		}
+		if e := s.advanceDeletions(t); e != nil {
+			return e
+		}
 		if e := s.planAgentUpdate(t, n, p, &out); e != nil {
 			return e
 		}
@@ -1091,6 +1084,30 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request) error {
 	})
 	if e != nil {
 		return e
+	}
+	s.packagesMu.Lock()
+	cleanupErr := s.recoverImports()
+	s.packagesMu.Unlock()
+	if cleanupErr != nil {
+		log.Printf("仓库清理暂未完成: %v", cleanupErr)
+		// A filesystem cleanup failure must not block heartbeats or result acks.
+		if err := s.DB.Update(func(t *store.Tx) error {
+			jobs, e := store.List[Deletion](t, "deletions")
+			if e != nil {
+				return e
+			}
+			for _, j := range jobs {
+				if j.State == "cleaned" {
+					j.Error = "客户端已清理，仓库清理失败: " + cleanupErr.Error()
+					if e = store.Put(t, "deletions", j.ID, j); e != nil {
+						return e
+					}
+				}
+			}
+			return nil
+		}); err != nil {
+			log.Printf("记录仓库清理错误: %v", err)
+		}
 	}
 	if len(out.Tasks) == 0 {
 		select {

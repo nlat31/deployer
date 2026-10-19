@@ -289,3 +289,32 @@ func (s *Server) downloadAgentRelease(w http.ResponseWriter, r *http.Request) er
 	http.ServeFile(w, r, filepath.Join(s.releasePath(d), "binary"))
 	return nil
 }
+
+// Only indexed, signature-verified releases are offered for rollout.
+func (s *Server) agentReleases(w http.ResponseWriter, r *http.Request) error {
+	result := []selfupdate.Manifest{}
+	err := s.DB.View(func(t *store.Tx) error {
+		digests, e := store.List[string](t, "agent_release_versions")
+		if e != nil {
+			return e
+		}
+		seen := map[string]bool{}
+		for _, d := range digests {
+			if seen[d] {
+				continue
+			}
+			seen[d] = true
+			m, e := s.release(d)
+			if e != nil {
+				continue
+			}
+			result = append(result, m)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	jsonOut(w, 200, result)
+	return nil
+}

@@ -10,6 +10,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
@@ -122,7 +123,7 @@ func TestControllerAgentLifecycle(t *testing.T) {
 	if o := wait(op.ID); o.Result != "succeeded" {
 		t.Fatal(o)
 	}
-	call("DELETE", "/api/apps/sample/versions/1.0.0?confirm=true", nil, 409, nil)
+	call("DELETE", "/api/apps/sample/versions/1.0.0", nil, 400, nil)
 	req = model.OperationRequest{Action: "stop", ExpectedRevision: op.Revision, IdempotencyKey: model.ID()}
 	call("POST", path, req, 202, &op)
 	if o := wait(op.ID); o.Result != "succeeded" {
@@ -186,6 +187,29 @@ func TestControllerAgentLifecycle(t *testing.T) {
 	}
 	if !completed {
 		t.Fatal("batch timed out")
+	}
+	var deletion controller.Deletion
+	call("DELETE", "/api/apps/sample?confirm=true", nil, 202, &deletion)
+	if len(deletion.Operations) != 2 {
+		t.Fatal(deletion)
+	}
+	for _, id := range deletion.Operations {
+		if o := wait(id); o.Result != "succeeded" {
+			t.Fatal(o)
+		}
+	}
+	for _, c := range []*Client{client, second} {
+		if _, err := os.Stat(filepath.Join(c.Root, "apps/sample")); !os.IsNotExist(err) {
+			t.Fatal("client directory remains", err)
+		}
+	}
+	var final struct {
+		Apps      []model.App           `json:"apps"`
+		Deletions []controller.Deletion `json:"deletions"`
+	}
+	call("GET", "/api/snapshot", nil, 200, &final)
+	if len(final.Apps) != 0 || len(final.Deletions) != 1 || final.Deletions[0].State != "completed" {
+		t.Fatal(final)
 	}
 	call("POST", "/api/users", map[string]any{"id": "reader", "name": "Reader", "role": "viewer", "password": "reader-password-123"}, 200, nil)
 	call("POST", "/api/login", map[string]string{"username": "reader", "password": "reader-password-123"}, 200, &session)

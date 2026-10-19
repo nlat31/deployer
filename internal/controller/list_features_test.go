@@ -189,17 +189,17 @@ func TestDeleteAppAndLastVersionRemoveCards(t *testing.T) {
 		})
 	}
 }
-func TestDeleteReferencedAppIsRejected(t *testing.T) {
+func TestDeleteReferencedAppQueuesCleanup(t *testing.T) {
 	s := newAuthServer(t, t.TempDir())
 	defer s.Close()
 	seedListDeploy(t, s)
 	b := &authBrowser{t: t, s: s}
 	b.login(DefaultAdminPassword, 200)
-	b.call("DELETE", "/apps/a?confirm=true", nil, 409)
+	b.call("DELETE", "/apps/a?confirm=true", nil, 202)
 	if e := s.DB.View(func(tx *store.Tx) error {
 		v, e := store.Get[model.Version](tx, "versions", "a/1")
-		if e == nil && v.Status != "available" {
-			t.Fatal("rejected deletion modified package")
+		if e == nil && v.Status != "removing_clients" {
+			t.Fatal("deletion did not retain package pending cleanup")
 		}
 		return e
 	}); e != nil {

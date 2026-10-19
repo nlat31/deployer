@@ -63,7 +63,15 @@ DEPLOYER_UPDATE_SIGNING_KEY="$PWD/update-private.key" \
 
 ## 上传与串行更新
 
-第一版提供管理员 API，下发目标版本无需更改 Agent 配置。主机页面显示版本、试运行/回退状态和错误。以下请求使用登录返回的会话 cookie 和 CSRF token；若账号启用了 MFA，先完成正常 MFA 登录流程。
+控制台侧栏“Agent 更新”直接完成以下流程，无需手工调用 API：
+
+1. 上传 `.manifest.json` 和 `.bin`；服务端校验签名、大小、摘要后列入版本选项。
+2. 选择目标版本和 1～100 台同平台、支持更新的客户端，确认创建批次。离线节点等待上线。
+3. 查看每台的排队、下载、试运行、提交观察及失败原因；可暂停或继续没有失败的批次。失败批次需修复后创建新批次。
+
+管理员可以上传和发布，其他角色只可查看。私钥不上传，公钥配置仍遵循上一节。页面不会自动选择所有节点，也不会默认发布刚上传的版本。Agent 更新不包括 launcher；变更 launcher 仍需停服后 setup。
+
+管理员 API 仍可用于自动化。以下请求使用登录返回的会话 cookie 和 CSRF token；若账号启用了 MFA，先完成正常 MFA 登录流程。
 
 ```bash
 # 使用真实控制端地址、受信任 CA 和登录会话；不要关闭 TLS 校验。
@@ -119,3 +127,14 @@ unshare -Ur env GOCACHE="$PWD/.cache/go-build" go test ./internal/supervisor ./i
 ```
 
 生命周期测试验证重复 setup/start/stop/remove、业务 PID 保留、失败回退、应用停止失败时保留部署和拒绝符号链接。Go 测试覆盖签名篡改、下载损坏、试运行崩溃/卡死、中断恢复、停止优先和串行批次熔断。
+
+## 控制台交互测试
+
+```bash
+npm --prefix web ci
+cd web
+npx playwright install chromium
+npm test
+```
+
+浏览器测试使用隔离的接口样本，覆盖 multipart 上传、平台筛选、批量更新、暂停、失败提示、只读权限及删除确认取消。Go 集成测试通过真实 mTLS 服务与两台 Agent 验证删除任务、目录清理和回报；Direct supervisor 测试验证真实进程先停止后删除。

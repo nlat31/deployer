@@ -120,6 +120,9 @@ func (e *Engine) Accept(o model.Operation) (bool, error) {
 		o.Result = ""
 		o.Acked = false
 		d.Revision = o.Revision
+		if o.Action == "remove_version" && o.Version == d.Current {
+			d.DesiredState = "stopped"
+		}
 		switch o.Action {
 		case "deploy", "switch", "rollback", "start", "restart":
 			d.DesiredVersion = o.Version
@@ -127,7 +130,7 @@ func (e *Engine) Accept(o model.Operation) (bool, error) {
 			if o.Start {
 				d.DesiredState = "running"
 			}
-		case "stop", "detach", "reconcile":
+		case "stop", "detach", "purge_app", "reconcile":
 			d.DesiredState = "stopped"
 		}
 		if err = store.Put(t, "deployments", o.AppID, d); err != nil {
@@ -312,7 +315,9 @@ func (e *Engine) Run(ctx context.Context, id string) error {
 		if o.Start {
 			d.DesiredState = "running"
 		}
-	case "stop", "detach":
+	case "purge_app", "detach", "remove_version":
+		return e.purge(ctx, &o, d)
+	case "stop":
 		if err = e.phase(&o, "stopping"); err != nil {
 			break
 		}
@@ -327,18 +332,12 @@ func (e *Engine) Run(ctx context.Context, id string) error {
 		d.RunState = "stopped"
 		d.RunningVersion = ""
 		d.Health = "unverified"
-		if o.Action == "detach" {
-			d.Current = ""
-			d.Previous = ""
-			d.DesiredVersion = ""
-			d.Config = model.Config{}
-			d.PreviousConfig = model.Config{}
-		}
+
 	case "clear_rollback":
 		d.Previous = ""
 		d.PreviousConfig = model.Config{}
-	case "clean_data", "remove_version":
-		if o.Version == d.Previous || o.Action == "remove_version" && o.Version == d.Current {
+	case "clean_data":
+		if o.Version == d.Previous {
 			err = fmt.Errorf("当前或回退版本受到保护")
 			break
 		}
@@ -369,71 +368,38 @@ func (e *Engine) Run(ctx context.Context, id string) error {
 			err = fmt.Errorf("目标版本仍有进程运行")
 			break
 		}
-		if o.Action == "clean_data" {
-			if err = e.phase(&o, "cleaning"); err != nil {
-				break
-			}
-			if err = packages.PlainDir(filepath.Join(sp.Dir(), "data")); err != nil {
-				break
-			}
-			ins.Initialized = false
-			if err = e.DB.Update(func(t *store.Tx) error { return store.Put(t, "installations", model.Key(o.AppID, o.Version), ins) }); err != nil {
-				break
-			}
-			if err = e.Supervisor.Hook(ctx, sp, "clean.sh", log); err != nil {
-				break
-			}
-			entries, er := os.ReadDir(filepath.Join(sp.Dir(), "data"))
-			if er != nil {
-				err = er
-				break
-			}
-			if len(entries) > 0 {
-				err = fmt.Errorf("clean.sh 未清空 data 目录")
-				break
-			}
-			ins.Initialized = false
-			ins.DataEpoch++
-			ins.DataBytes = 0
-			err = e.DB.Update(func(t *store.Tx) error {
-				if er := store.Put(t, "installations", model.Key(o.AppID, o.Version), ins); er != nil {
-					return er
-				}
-				return e.finishTx(t, &o, d, "succeeded", "")
-			})
-			return err
-		} else {
-			if err = e.phase(&o, "removing"); err != nil {
-				break
-			}
-			if _, er := os.Stat(sp.Dir()); !os.IsNotExist(er) {
-				if err = packages.PlainDir(sp.Dir()); err != nil {
-					break
-				}
-				if err = packages.PlainDir(filepath.Join(sp.Dir(), "data")); err != nil {
-					break
-				}
-				entries, er := os.ReadDir(filepath.Join(sp.Dir(), "data"))
-				if er != nil {
-					err = er
-					break
-				}
-				if len(entries) > 0 {
-					err = fmt.Errorf("data 目录非空，请先清理数据")
-					break
-				}
-			}
-			if err = os.RemoveAll(sp.Dir()); err != nil {
-				break
-			}
-			err = e.DB.Update(func(t *store.Tx) error {
-				if er := store.Delete(t, "installations", model.Key(o.AppID, o.Version)); er != nil {
-					return er
-				}
-				return e.finishTx(t, &o, d, "succeeded", "")
-			})
-			return err
+		if err = e.phase(&o, "cleaning"); err != nil {
+			break
 		}
+		if err = packages.PlainDir(filepath.Join(sp.Dir(), "data")); err != nil {
+			break
+		}
+		ins.Initialized = false
+		if err = e.DB.Update(func(t *store.Tx) error { return store.Put(t, "installations", model.Key(o.AppID, o.Version), ins) }); err != nil {
+			break
+		}
+		if err = e.Supervisor.Hook(ctx, sp, "clean.sh", log); err != nil {
+			break
+		}
+		entries, er := os.ReadDir(filepath.Join(sp.Dir(), "data"))
+		if er != nil {
+			err = er
+			break
+		}
+		if len(entries) > 0 {
+			err = fmt.Errorf("clean.sh 未清空 data 目录")
+			break
+		}
+		ins.Initialized = false
+		ins.DataEpoch++
+		ins.DataBytes = 0
+		err = e.DB.Update(func(t *store.Tx) error {
+			if er := store.Put(t, "installations", model.Key(o.AppID, o.Version), ins); er != nil {
+				return er
+			}
+			return e.finishTx(t, &o, d, "succeeded", "")
+		})
+		return err
 	case "logs":
 		if d.Current == "" {
 			err = fmt.Errorf("没有当前版本")
@@ -510,8 +476,10 @@ func (e *Engine) finish(o *model.Operation, d model.Deployment, result, message 
 }
 func (e *Engine) currentLink(d model.Deployment) error {
 	root := filepath.Join(e.Root, "apps", d.AppID)
-	if er := os.MkdirAll(root, 0755); er != nil {
-		return er
+	for _, p := range []string{e.Root, filepath.Join(e.Root, "apps"), root} {
+		if err := packages.PlainDir(p); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 	link := filepath.Join(root, "current")
 	if d.Current == "" {
@@ -520,6 +488,9 @@ func (e *Engine) currentLink(d model.Deployment) error {
 			return nil
 		}
 		return err
+	}
+	if er := os.MkdirAll(root, 0755); er != nil {
+		return er
 	}
 	temp := filepath.Join(root, ".current-"+model.ID())
 	if err := os.Symlink(filepath.Join("versions", d.Current), temp); err != nil {
