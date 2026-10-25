@@ -10,6 +10,8 @@ import (
 )
 
 type Batch struct {
+	Failed           int                     `json:"failed"`
+	Failures         map[string]string       `json:"failures,omitempty"`
 	Skipped          int                     `json:"skipped"`
 	ID               string                  `json:"id"`
 	AppID            string                  `json:"app_id"`
@@ -36,8 +38,8 @@ func (s *Server) createBatch(w http.ResponseWriter, r *http.Request) error {
 	if e := decode(w, r, &in); e != nil {
 		return e
 	}
-	if len(in.Nodes) < 2 || len(in.Nodes) > 100 || !model.ValidName(in.AppID) || !model.ValidName(in.Request.Version) || (in.Request.Action != "deploy" && in.Request.Action != "install" && in.Request.Action != "switch") {
-		return fail(400, "批量部署需要 2 至 100 台主机和有效版本")
+	if len(in.Nodes) < 1 || len(in.Nodes) > 100 || !model.ValidName(in.AppID) || (in.Request.Action != "detach" && !model.ValidName(in.Request.Version)) || (in.Request.Action != "deploy" && in.Request.Action != "install" && in.Request.Action != "switch" && in.Request.Action != "detach") {
+		return fail(400, "批量操作需要 1 至 100 台设备和有效操作")
 	}
 	if e := model.ValidEnv(in.Request.Env); e != nil {
 		return fail(400, e.Error())
@@ -51,11 +53,17 @@ func (s *Server) createBatch(w http.ResponseWriter, r *http.Request) error {
 	}
 	b := Batch{ID: model.ID(), AppID: in.AppID, Nodes: in.Nodes, Request: in.Request, Actor: actor(r).ID, State: "running", CreatedAt: model.Now(), Operations: []string{}}
 	e := s.DB.Update(func(t *store.Tx) error {
-		v, e := store.Get[model.Version](t, "versions", model.Key(b.AppID, b.Request.Version))
+		v := model.Version{}
+		var e error
+		if b.Request.Action != "detach" {
+			v, e = store.Get[model.Version](t, "versions", model.Key(b.AppID, b.Request.Version))
+		} else if !b.Request.Confirm {
+			return fail(400, "请确认批量解除部署")
+		}
 		if e != nil {
 			return e
 		}
-		if v.Status != "available" {
+		if b.Request.Action != "detach" && v.Status != "available" {
 			return fail(409, "版本不可用")
 		}
 		seen := map[string]bool{}
@@ -68,7 +76,7 @@ func (s *Server) createBatch(w http.ResponseWriter, r *http.Request) error {
 			if e != nil {
 				return e
 			}
-			if model.Now()-n.LastSeen > 30000 || n.Arch != v.Arch || n.OS != v.OS {
+			if model.Now()-n.LastSeen > 30000 || (b.Request.Action != "detach" && (n.Arch != v.Arch || n.OS != v.OS)) {
 				return fail(409, "存在离线或平台不匹配的主机")
 			}
 		}
@@ -112,19 +120,17 @@ func (s *Server) advanceBatches() error {
 				continue
 			}
 			if op.Result != "succeeded" {
-				b.State = "failed"
-				b.Error = "节点 " + op.NodeID + " 部署未成功，后续节点未派发"
-			} else {
-				if op.Skipped {
-					b.Skipped++
-				}
-				b.Index++
-				b.CurrentOperation = ""
-				b.Prepared = nil
-				if b.Index == len(b.Nodes) {
-					b.State = "succeeded"
-				}
+				b.recordFailure(op.NodeID, op.Error)
+			} else if op.Skipped {
+				b.Skipped++
 			}
+			b.Index++
+			b.CurrentOperation = ""
+			b.Prepared = nil
+			if b.Index == len(b.Nodes) {
+				b.complete()
+			}
+
 			if e := s.DB.Update(func(t *store.Tx) error { return store.Put(t, "batches", b.ID, b) }); e != nil {
 				return e
 			}
@@ -153,8 +159,12 @@ func (s *Server) advanceBatches() error {
 		var op model.Operation
 		e := s.enqueue(b.Nodes[b.Index], b.AppID, *b.Prepared, b.Actor, &op)
 		if e != nil {
-			b.State = "failed"
-			b.Error = e.Error()
+			b.recordFailure(b.Nodes[b.Index], e.Error())
+			b.Index++
+			b.Prepared = nil
+			if b.Index == len(b.Nodes) {
+				b.complete()
+			}
 		} else {
 			b.CurrentOperation = op.ID
 			b.Operations = append(b.Operations, op.ID)
@@ -163,5 +173,61 @@ func (s *Server) advanceBatches() error {
 			return e
 		}
 	}
+	return nil
+}
+
+func (b *Batch) recordFailure(node, message string) {
+	if b.Failures == nil {
+		b.Failures = map[string]string{}
+	}
+	if message == "" {
+		message = "操作未成功"
+	}
+	b.Failures[node] = message
+	b.Failed++
+	b.Error = "部分设备操作失败，详见各设备失败原因"
+}
+func (b *Batch) complete() {
+	if b.Failed > 0 {
+		b.State = "completed_with_errors"
+	} else {
+		b.State = "succeeded"
+	}
+}
+func (s *Server) cancelBatch(w http.ResponseWriter, r *http.Request) error {
+	s.batchMu.Lock()
+	defer s.batchMu.Unlock()
+	err := s.DB.Update(func(t *store.Tx) error {
+		b, err := store.Get[Batch](t, "batches", r.PathValue("id"))
+		if err != nil {
+			return err
+		}
+		if b.State != "running" {
+			return nil
+		}
+		if b.CurrentOperation == "" && b.Prepared != nil && b.Index < len(b.Nodes) {
+			key := hash(b.Nodes[b.Index] + "/" + b.AppID + "/" + b.Prepared.IdempotencyKey)
+			id, lookupErr := store.Get[string](t, "operation_requests", key)
+			if lookupErr == nil {
+				b.CurrentOperation = id
+			} else if !errors.Is(lookupErr, store.ErrNotFound) {
+				return lookupErr
+			}
+		}
+		if b.CurrentOperation != "" {
+			if err = cancelOperationTx(t, b.CurrentOperation); err != nil {
+				return err
+			}
+		}
+		b.State = "cancelled"
+		if err = store.Put(t, "batches", b.ID, b); err != nil {
+			return err
+		}
+		return audit(t, actor(r).ID, "cancel_batch", b.ID)
+	})
+	if err != nil {
+		return err
+	}
+	jsonOut(w, 200, map[string]bool{"ok": true})
 	return nil
 }

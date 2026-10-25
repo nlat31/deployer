@@ -182,8 +182,8 @@ func TestOfflineHostManualDeleteAndAuthenticatedReappearance(t *testing.T) {
 		if e != nil {
 			return e
 		}
-		if batch.State != "failed" {
-			t.Fatal("deleted host batch still running")
+		if batch.State != "running" {
+			t.Fatal("deleting an offline node aborted the remaining batch")
 		}
 		return nil
 	}); err != nil {

@@ -156,6 +156,7 @@ type Installation struct {
 	StartedAt   int64  `json:"started_at"`
 }
 type Operation struct {
+	CancelRequested  bool       `json:"cancel_requested,omitempty"`
 	Skipped          bool       `json:"skipped,omitempty"`
 	ID               string     `json:"id"`
 	NodeID           string     `json:"node_id"`
@@ -239,6 +240,7 @@ type TaskRejection struct {
 	LocalRevision int64  `json:"local_revision"`
 }
 type PollResponse struct {
+	Cancelled    []Operation          `json:"cancelled,omitempty"`
 	Deleted      []Deleted            `json:"deleted,omitempty"`
 	Update       *selfupdate.Manifest `json:"update,omitempty"`
 	Tasks        []Operation          `json:"tasks"`

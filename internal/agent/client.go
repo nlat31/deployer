@@ -343,6 +343,15 @@ func (c *Client) poll(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	for _, task := range response.Cancelled {
+		if _, err := c.Engine.Accept(task); err != nil {
+			return err
+		}
+		if err := c.Engine.RequestCancel(task.ID); err != nil {
+			return err
+		}
+		response.Tasks = append(response.Tasks, task)
+	}
 	c.scheduleUpdate(ctx, response.Update)
 	if launcher.Draining() || launcher.Trial() {
 		return nil
@@ -363,6 +372,7 @@ func (c *Client) poll(ctx context.Context) error {
 			}()
 		}
 	}
+
 	for _, task := range response.Tasks {
 		if _, loaded := c.running.LoadOrStore(task.ID, true); loaded {
 			continue
@@ -402,6 +412,7 @@ func (c *Client) executeTask(ctx context.Context, task model.Operation) {
 	if saved.Terminal() {
 		return
 	}
+
 	if fresh {
 		err = c.Engine.Run(ctx, saved.ID)
 	} else {

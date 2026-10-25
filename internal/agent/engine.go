@@ -27,6 +27,7 @@ type Engine struct {
 	Download   Downloader
 	mu         sync.Mutex
 	active     map[string]bool
+	cancels    map[string]context.CancelFunc
 	cacheMu    sync.RWMutex
 }
 
@@ -167,6 +168,27 @@ func (e *Engine) Run(ctx context.Context, id string) error {
 	defer func() { e.mu.Lock(); delete(e.active, o.AppID); e.mu.Unlock() }()
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 	defer cancel()
+	e.mu.Lock()
+	if e.cancels == nil {
+		e.cancels = map[string]context.CancelFunc{}
+	}
+	e.cancels[id] = cancel
+	e.mu.Unlock()
+	defer func() { e.mu.Lock(); delete(e.cancels, id); e.mu.Unlock() }()
+	if requested, err := e.cancelRequested(id); err != nil {
+		return err
+	} else if requested {
+		d := o.Before
+		result := "cancelled"
+		if o.Stage != "accepted" && o.Stage != "preparing" && o.Stage != "setting_up" {
+			d.RunState = "unknown"
+			d.Health = "unknown"
+			d.DesiredState = "stopped"
+			result = "needs_attention"
+		}
+		return e.finish(&o, d, result, "管理员已取消任务；已中断启停时需核对现场")
+	}
+
 	log := func(s string) { _ = e.Event(o, s) }
 	d := o.Before
 	d.Revision = o.Revision
@@ -409,6 +431,20 @@ func (e *Engine) Run(ctx context.Context, id string) error {
 		err = fmt.Errorf("未知操作 %s", o.Action)
 	}
 	if ctx.Err() != nil {
+		requested, cancelErr := e.cancelRequested(id)
+		if cancelErr != nil {
+			return cancelErr
+		}
+		if requested {
+			result := "cancelled"
+			if disturbed {
+				result = "needs_attention"
+				d.DesiredState = "stopped"
+				d.RunState = "unknown"
+				d.Health = "unknown"
+			}
+			return e.finish(&o, d, result, "管理员已取消任务；保留当前现场，不自动切换或重启 App")
+		}
 		_ = e.Event(o, "执行上下文结束；保留阶段记录供重启恢复")
 		return ctx.Err()
 	}
@@ -438,6 +474,9 @@ func (e *Engine) finishTx(t *store.Tx, o *model.Operation, d model.Deployment, r
 				message = strings.ReplaceAll(message, value, "[redacted]")
 			}
 		}
+	}
+	if err := store.Delete(t, "cancel_requests", o.ID); err != nil {
+		return err
 	}
 	o.Result = result
 	o.Stage = "finished"
@@ -730,6 +769,11 @@ func (e *Engine) RecoverOperation(ctx context.Context, o model.Operation) error 
 				return er
 			}
 		}
+	}
+	if requested, err := e.cancelRequested(o.ID); err != nil {
+		return err
+	} else if requested {
+		return e.Run(ctx, o.ID)
 	}
 	switch o.Stage {
 	case "starting", "checking", "recovering":

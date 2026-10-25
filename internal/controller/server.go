@@ -130,6 +130,9 @@ func New(root string, secure bool, ui http.Handler) (*Server, error) {
 	s.mux.HandleFunc("POST /api/apps/{app}/versions", s.authorize("operator", s.upload))
 	s.mux.HandleFunc("DELETE /api/apps/{app}/versions/{version}", s.authorize("admin", s.deleteVersion))
 	s.mux.HandleFunc("POST /api/nodes/{node}/apps/{app}/operations", s.authorize("operator", s.createOperation))
+	s.mux.HandleFunc("POST /api/batches/{id}/cancel", s.authorize("operator", s.cancelBatch))
+	s.mux.HandleFunc("POST /api/operations/{id}/cancel", s.authorize("operator", s.cancelOperation))
+	s.mux.HandleFunc("DELETE /api/nodes/offline", s.authorize("admin", s.deleteOfflineNodes))
 	s.mux.HandleFunc("POST /api/batches", s.authorize("operator", s.createBatch))
 	s.mux.HandleFunc("GET /api/operations/{id}", s.authorize("viewer", s.operation))
 	s.mux.HandleFunc("GET /api/operations/{id}/events", s.authorize("viewer", s.events))
@@ -239,7 +242,7 @@ func (s *Server) snapshot(w http.ResponseWriter, r *http.Request) error {
 		if e != nil {
 			return e
 		}
-		recent, e := store.Query[model.Operation](t, "operations", store.Filter{Limit: 200, States: []string{"succeeded", "failed", "failed_recovered", "failed_recovery"}})
+		recent, e := store.Query[model.Operation](t, "operations", store.Filter{Limit: 200, States: []string{"succeeded", "failed", "failed_recovered", "failed_recovery", "cancelled"}})
 		if e != nil {
 			return e
 		}
@@ -1054,9 +1057,6 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request) error {
 		if e := s.planAgentUpdate(t, n, p, &out); e != nil {
 			return e
 		}
-		if p.Draining || p.Trial {
-			return nil
-		}
 		ops, e := store.Query[model.Operation](t, "operations", store.Filter{Owner: n.ID, States: []string{"active"}, Asc: true})
 		if e != nil {
 			return e
@@ -1066,8 +1066,15 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request) error {
 			if op.NodeID != n.ID || op.Terminal() {
 				continue
 			}
+			if op.CancelRequested {
+				out.Cancelled = append(out.Cancelled, op)
+				continue
+			}
+			if p.Draining || p.Trial {
+				continue
+			}
 			if len(out.Tasks) >= 2 {
-				break
+				continue
 			}
 			if op.Stage == "queued" {
 				op.Stage = "dispatched"
@@ -1083,7 +1090,7 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request) error {
 	if e != nil {
 		return e
 	}
-	if len(out.Tasks) == 0 {
+	if len(out.Tasks) == 0 && len(out.Cancelled) == 0 {
 		select {
 		case <-time.After(2 * time.Second):
 		case <-r.Context().Done():

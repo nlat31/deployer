@@ -19,6 +19,13 @@ import (
 func (e *Engine) purge(ctx context.Context, o *model.Operation, d model.Deployment) error {
 	next, err := e.purgeFiles(ctx, o, d, func(stage string) error { return e.phase(o, stage) }, func(s string) { _ = e.Event(*o, s) })
 	if err != nil {
+		requested, cancelErr := e.cancelRequested(o.ID)
+		if cancelErr != nil {
+			return cancelErr
+		}
+		if requested && ctx.Err() != nil {
+			return e.finish(o, next, "needs_attention", "管理员已取消清理，保留当前现场，请管理员核对")
+		}
 		return e.finish(o, next, "failed", err.Error())
 	}
 	return e.finish(o, next, "succeeded", "")

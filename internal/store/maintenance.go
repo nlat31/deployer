@@ -11,7 +11,7 @@ func (s *Store) Maintain() error {
 		if err := Prune(t); err != nil {
 			return err
 		}
-		ops, err := Query[model.Operation](t, "operations", Filter{States: []string{"succeeded", "failed", "failed_recovered", "failed_recovery"}, Before: time.Now().Add(-30 * 24 * time.Hour).UnixMilli(), Limit: 1000})
+		ops, err := Query[model.Operation](t, "operations", Filter{States: []string{"succeeded", "failed", "failed_recovered", "failed_recovery", "cancelled"}, Before: time.Now().Add(-30 * 24 * time.Hour).UnixMilli(), Limit: 1000})
 		if err != nil {
 			return err
 		}

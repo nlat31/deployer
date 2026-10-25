@@ -15,10 +15,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
-func TestAgentReleaseAndSequentialRollout(t *testing.T) {
+func TestAgentReleaseAndParallelRollout(t *testing.T) {
 	s, e := New(t.TempDir(), false, http.NotFoundHandler())
 	if e != nil {
 		t.Fatal(e)
@@ -74,19 +73,13 @@ func TestAgentReleaseAndSequentialRollout(t *testing.T) {
 		}
 		return out
 	}
-	if poll("n2", selfupdate.Status{Capable: true}).Update != nil {
-		t.Fatal("parallel rollout")
+	if poll("n2", selfupdate.Status{Capable: true}).Update == nil {
+		t.Fatal("parallel host not released")
 	}
 	if poll("n1", selfupdate.Status{Capable: true}).Update == nil {
 		t.Fatal("missing target")
 	}
 	status := selfupdate.Status{Capable: true, Digest: digest, Phase: "committed"}
-	poll("n1", status)
-	s.DB.Update(func(tx *store.Tx) error {
-		r, _ := store.Get[AgentRollout](tx, "settings", "agent_rollout")
-		r.HealthySince = model.Now() - int64(6*time.Minute/time.Millisecond)
-		return store.Put(tx, "settings", "agent_rollout", r)
-	})
 	poll("n1", status)
 	if poll("n2", selfupdate.Status{Capable: true}).Update == nil {
 		t.Fatal("next host not released")
@@ -94,7 +87,7 @@ func TestAgentReleaseAndSequentialRollout(t *testing.T) {
 	poll("n2", selfupdate.Status{Target: digest, Phase: "failed", Error: "crash"})
 	s.DB.View(func(tx *store.Tx) error {
 		r, _ := store.Get[AgentRollout](tx, "settings", "agent_rollout")
-		if !r.Paused || r.Error != "crash" {
+		if !r.Paused || r.Error != "n2: crash" {
 			t.Fatal(r)
 		}
 		return nil

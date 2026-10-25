@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,21 +9,56 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"time"
+	"strconv"
+	"strings"
 
 	"deployer/internal/model"
 	"deployer/internal/selfupdate"
 	"deployer/internal/store"
 )
 
+const agentRolloutConcurrency = 20
+
 type AgentRollout struct {
-	Digest       string   `json:"digest"`
-	Nodes        []string `json:"nodes"`
-	Index        int      `json:"index"`
-	Paused       bool     `json:"paused"`
-	Error        string   `json:"error,omitempty"`
-	HealthySince int64    `json:"healthy_since,omitempty"`
-	LastHealthy  int64    `json:"last_healthy,omitempty"`
+	Digest    string          `json:"digest"`
+	Nodes     []string        `json:"nodes"`
+	Index     int             `json:"index"`
+	Paused    bool            `json:"paused"`
+	Error     string          `json:"error,omitempty"`
+	Active    map[string]bool `json:"active"`
+	Completed map[string]bool `json:"completed"`
+}
+
+// Keep Index as the completed prefix for old readers. Completed also records
+// hosts that finish out of order. Persist reservations before offering updates.
+func (r *AgentRollout) normalize() {
+	if r.Completed == nil {
+		r.Completed = map[string]bool{}
+		for i, id := range r.Nodes {
+			if i < r.Index {
+				r.Completed[id] = true
+			}
+		}
+		// Preserve the one host already authorized by the former serial rollout.
+		if r.Index >= 0 && r.Index < len(r.Nodes) {
+			if r.Active == nil {
+				r.Active = map[string]bool{}
+			}
+			r.Active[r.Nodes[r.Index]] = true
+		}
+	}
+	if r.Active == nil {
+		r.Active = map[string]bool{}
+	}
+}
+
+func (r AgentRollout) includes(id string) bool {
+	for _, node := range r.Nodes {
+		if node == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) releasePath(d string) string { return filepath.Join(s.Root, "agent-releases", d) }
@@ -156,6 +192,7 @@ func (s *Server) setAgentRollout(w http.ResponseWriter, r *http.Request) error {
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			return err
 		}
+		old.normalize()
 		if in.Digest == "" {
 			if err != nil {
 				return fail(404, "没有更新批次")
@@ -186,7 +223,7 @@ func (s *Server) setAgentRollout(w http.ResponseWriter, r *http.Request) error {
 					return fail(409, "主机平台或更新能力不匹配: "+id)
 				}
 			}
-			old = AgentRollout{Digest: in.Digest, Nodes: in.Nodes, Paused: in.Paused}
+			old = AgentRollout{Digest: in.Digest, Nodes: in.Nodes, Paused: in.Paused, Active: map[string]bool{}, Completed: map[string]bool{}}
 		}
 		if e := store.Put(t, "settings", "agent_rollout", old); e != nil {
 			return e
@@ -211,6 +248,7 @@ func (s *Server) agentRollout(w http.ResponseWriter, r *http.Request) error {
 	if e != nil {
 		return e
 	}
+	result.normalize()
 	jsonOut(w, 200, result)
 	return nil
 }
@@ -222,36 +260,27 @@ func (s *Server) planAgentUpdate(t *store.Tx, n model.Node, p model.Poll, out *m
 	if e != nil {
 		return e
 	}
-	if roll.Index >= len(roll.Nodes) || roll.Nodes[roll.Index] != n.ID {
+	if !roll.includes(n.ID) {
+		return nil
+	}
+	roll.normalize()
+	if roll.Completed[n.ID] {
 		return nil
 	}
 	if p.AgentUpdate.Target == roll.Digest && p.AgentUpdate.Phase == "failed" {
 		roll.Paused = true
-		roll.Error = p.AgentUpdate.Error
+		roll.Error = n.ID + ": " + p.AgentUpdate.Error
 		return store.Put(t, "settings", "agent_rollout", roll)
-	}
-	if roll.Paused {
-		return nil
 	}
 	if p.AgentUpdate.Digest == roll.Digest && p.AgentUpdate.Phase == "committed" && !p.Trial {
-		now := model.Now()
-		if roll.HealthySince == 0 || now-roll.LastHealthy > 30000 {
-			roll.HealthySince = now
-		}
-		roll.LastHealthy = now
-		if now-roll.HealthySince >= int64(5*time.Minute/time.Millisecond) {
+		roll.Completed[n.ID] = true
+		delete(roll.Active, n.ID)
+		for roll.Index < len(roll.Nodes) && roll.Completed[roll.Nodes[roll.Index]] {
 			roll.Index++
-			roll.HealthySince = 0
-			roll.LastHealthy = 0
 		}
 		return store.Put(t, "settings", "agent_rollout", roll)
 	}
-	roll.HealthySince = 0
-	roll.LastHealthy = 0
-	if e = store.Put(t, "settings", "agent_rollout", roll); e != nil {
-		return e
-	}
-	if !p.AgentUpdate.Capable {
+	if roll.Paused || !p.AgentUpdate.Capable || p.Trial || p.Draining || (!roll.Active[n.ID] && len(roll.Active) >= agentRolloutConcurrency) {
 		return nil
 	}
 	m, e := s.release(roll.Digest)
@@ -259,6 +288,10 @@ func (s *Server) planAgentUpdate(t *store.Tx, n model.Node, p model.Poll, out *m
 		roll.Paused = true
 		roll.Error = "发布不可用，已暂停更新: " + e.Error()
 		return store.Put(t, "settings", "agent_rollout", roll)
+	}
+	roll.Active[n.ID] = true
+	if e = store.Put(t, "settings", "agent_rollout", roll); e != nil {
+		return e
 	}
 	out.Update = &m
 	return nil
@@ -277,7 +310,8 @@ func (s *Server) downloadAgentRelease(w http.ResponseWriter, r *http.Request) er
 		if e != nil {
 			return e
 		}
-		allowed = !roll.Paused && roll.Index < len(roll.Nodes) && roll.Nodes[roll.Index] == agentNode(r).ID && roll.Digest == d
+		roll.normalize()
+		allowed = !roll.Paused && roll.Active[agentNode(r).ID] && roll.includes(agentNode(r).ID) && roll.Digest == d
 		return nil
 	})
 	if e != nil {
@@ -286,8 +320,81 @@ func (s *Server) downloadAgentRelease(w http.ResponseWriter, r *http.Request) er
 	if !allowed {
 		return fail(403, "没有此版本的更新授权")
 	}
-	http.ServeFile(w, r, filepath.Join(s.releasePath(d), "binary"))
+	path := filepath.Join(s.releasePath(d), "binary")
+	w.Header().Add("Vary", "Accept-Encoding")
+	// Default Go transports transparently decompress gzip before the existing
+	// signed size/digest verification. Ranges keep the original representation.
+	if r.Header.Get("Range") == "" && acceptsAgentGzip(r.Header.Get("Accept-Encoding")) {
+		path, e = s.compressedAgentRelease(path)
+		if e != nil {
+			return e
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+	http.ServeFile(w, r, path)
 	return nil
+}
+
+func acceptsAgentGzip(header string) bool {
+	for _, item := range strings.Split(header, ",") {
+		parts := strings.Split(item, ";")
+		if !strings.EqualFold(strings.TrimSpace(parts[0]), "gzip") {
+			continue
+		}
+		for _, parameter := range parts[1:] {
+			key, value, _ := strings.Cut(strings.TrimSpace(parameter), "=")
+			if strings.EqualFold(key, "q") {
+				q, err := strconv.ParseFloat(value, 64)
+				if err != nil || !(q > 0 && q <= 1) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// Releases are immutable. Build one atomic on-disk representation for all
+// clients, rather than recompressing a binary on every download/heartbeat.
+func (s *Server) compressedAgentRelease(path string) (string, error) {
+	s.packagesMu.Lock()
+	defer s.packagesMu.Unlock()
+	target := path + ".gz"
+	if _, err := os.Stat(target); err == nil {
+		return target, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	source, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer source.Close()
+	f, err := os.CreateTemp(filepath.Dir(path), ".gzip-")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(f.Name())
+	z := gzip.NewWriter(f)
+	_, err = io.Copy(z, source)
+	if ce := z.Close(); err == nil {
+		err = ce
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if ce := f.Close(); err == nil {
+		err = ce
+	}
+	if err == nil {
+		err = os.Rename(f.Name(), target)
+	}
+	if err == nil {
+		err = selfupdate.SyncDir(filepath.Dir(path))
+	}
+	return target, err
 }
 
 // Only indexed, signature-verified releases are offered for rollout.

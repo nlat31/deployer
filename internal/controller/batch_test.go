@@ -8,7 +8,7 @@ import (
 	"deployer/internal/store"
 )
 
-func TestBatchStopsAfterFailureAndRecoversDispatch(t *testing.T) {
+func TestBatchContinuesAfterFailureAndRecoversDispatch(t *testing.T) {
 	s, e := New(t.TempDir(), false, http.NotFoundHandler())
 	if e != nil {
 		t.Fatal(e)
@@ -70,8 +70,8 @@ func TestBatchStopsAfterFailureAndRecoversDispatch(t *testing.T) {
 	s.DB.View(func(tx *store.Tx) error {
 		b, _ = store.Get[Batch](tx, "batches", b.ID)
 		ops, _ := store.List[model.Operation](tx, "operations")
-		if b.State != "failed" || len(ops) != 1 {
-			t.Fatal("batch continued after failure")
+		if b.State != "running" || len(ops) != 2 || b.Failed != 1 || b.Index != 1 {
+			t.Fatal("batch did not continue after failure")
 		}
 		return nil
 	})

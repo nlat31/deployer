@@ -7,11 +7,14 @@ async function fixture(page:any,admin=true){
  await page.route('**/api/**',async(route:any)=>{
  const req=route.request(),path=new URL(req.url()).pathname;let body:any={};
  if(path==='/api/session')body={csrf:'test-token',user:{id:'admin',name:'Admin',role:admin?'admin':'viewer'}};
- else if(path==='/api/snapshot')body={apps:state.apps??[{id:'demo',name:'Demo',health:{type:'process'}}],versions:[{app_id:'demo',version:'1',arch:'amd64',status:'available',size:10}],nodes:state.nodes,deployments:[{node_id:'client-a',app_id:'demo',current:'1',desired_version:'1',desired_state:'running',running_version:'1',run_state:'running',revision:1,health:state.healthError?'unhealthy':'healthy',error:state.healthError||'',cleanup_error:state.cleanupError||''}],operations:state.operations??[],inventories:{'client-a':[{app_id:'demo',version:'1',initialized:true,installed_at:1700000000000,started_at:1700000060000},{app_id:'demo',version:'2',initialized:true,installed_at:1700000120000,started_at:0}]}};
+ else if(path==='/api/snapshot')body={apps:state.apps??[{id:'demo',name:'Demo',health:{type:'process'}}],versions:[{app_id:'demo',version:'1',arch:'amd64',status:'available',size:10}],nodes:state.nodes,batches:state.batches??[],deployments:state.deployments??[{node_id:'client-a',app_id:'demo',current:'1',desired_version:'1',desired_state:'running',running_version:'1',run_state:'running',revision:1,health:state.healthError?'unhealthy':'healthy',error:state.healthError||'',cleanup_error:state.cleanupError||''}],operations:state.operations??[],inventories:state.inventories??{'client-a':[{app_id:'demo',version:'1',initialized:true,installed_at:1700000000000,started_at:1700000060000},{app_id:'demo',version:'2',initialized:true,installed_at:1700000120000,started_at:0}]}};
  else if(path==='/api/agent-releases'){
   if(req.method()==='POST'){expect(req.headers()['x-csrf-token']).toBe('test-token');expect(req.headers()['content-type']).toContain('multipart/form-data; boundary=');expect(req.postData()).toContain('name="manifest"');expect(req.postData()).toContain('name="binary"');state.uploads++;state.releases=[release];body=release}else body=state.releases;
  }else if(path==='/api/agent-rollout'){
   if(req.method()==='POST'){const data=req.postDataJSON();state.requests.push(data);state.roll=data.digest?{...data,index:0,paused:false}:{...state.roll,...data}}body=state.roll;
+ }else if(path==='/api/batches'&&req.method()==='POST'){const data=req.postDataJSON();state.requests.push(data);state.batches=[{id:'batch-new',...data,index:0,skipped:0,failed:0,state:'running'}];body=state.batches[0]
+ }else if(path.endsWith('/cancel')&&req.method()==='POST'){state.requests.push({path});const batch=state.batches?.find((b:any)=>path===`/api/batches/${b.id}/cancel`);if(batch)batch.state='cancelled';const op=state.operations?.find((o:any)=>path===`/api/operations/${o.id}/cancel`);if(op)op.cancel_requested=true;body={ok:true}
+ }else if(path==='/api/nodes/offline'&&req.method()==='DELETE'){const old=state.nodes.length;state.nodes=state.nodes.filter((n:any)=>Date.now()-n.last_seen<30000);state.deletes.push(path);body={deleted:old-state.nodes.length}
  }else if(path.endsWith('/operations')&&req.method()==='POST'){const data=req.postDataJSON();state.actions.push({path,...data});body={id:'op-'+state.actions.length,app_id:'demo',node_id:'client-a',...data,result:'succeeded'}}else if(req.method()==='DELETE'){state.deletes.push(path);body={state:'pending'}};
  await route.fulfill({json:body});
  });
@@ -28,6 +31,17 @@ test('upload, select compatible clients, rollout progress, pause, failure',async
  await page.getByRole('button',{name:'暂停批次',exact:true}).click();await expect.poll(()=>s.roll.paused).toBe(true);await expect(page.getByRole('button',{name:'继续批次',exact:true})).toBeVisible();
  s.roll.error='trial exited: exit status 42';s.nodes[0].agent_update={version:'1.0',digest:'old',target:digest,phase:'failed',error:'trial exited: exit status 42',capable:true};await expect(page.getByRole('cell',{name:'trial exited: exit status 42',exact:true})).toBeVisible();
  await page.screenshot({path:'test-results/agent-updates.png',fullPage:true});
+});
+test('parallel update progress records out-of-order completion',async({page})=>{
+ const s=await fixture(page);s.releases=[release];s.roll={digest,nodes:['client-a','client-b'],index:0,paused:false,active:{'client-a':true},completed:{'client-b':true}};
+ s.nodes[0].agent_update={version:'2.0',digest:'old',target:digest,phase:'trial',capable:true};
+ s.nodes[1].agent_update={version:'2.0',digest,phase:'committed',capable:true};
+ await page.getByRole('button',{name:'Agent 更新',exact:false}).click();
+ await expect(page.getByText(/已完成 1\/2 台/)).toBeVisible();
+ await expect(page.getByText(/最多 20 台并行更新/)).toBeVisible();
+ const section=page.locator('section').filter({has:page.getByRole('heading',{name:'当前更新批次'})});
+ await expect(section.getByRole('row').filter({hasText:'client-b'}).getByRole('cell',{name:'已完成',exact:true})).toBeVisible();
+ await expect(section.getByRole('row').filter({hasText:'client-a'}).getByRole('cell',{name:'试运行',exact:true})).toBeVisible();
 });
 test('deletion requires confirmation describing stop and permanent data removal',async({page})=>{
  const s=await fixture(page);await page.getByRole('button',{name:'应用仓库',exact:false}).click();
@@ -109,4 +123,30 @@ test('repository-missing app cannot receive a bulk version switch',async({page})
  await page.getByRole('button',{name:'▤ 设备列表'}).click();await expect(page.getByRole('option',{name:'demo（仓库已删除，等待清理） · demo'})).toHaveCount(1);
  await page.getByLabel('按应用筛选').selectOption('demo');await page.getByRole('button',{name:'全选在线设备'}).click();
  await expect(page.getByRole('button',{name:'切换所选设备版本',exact:true})).toBeDisabled();await expect(page.getByRole('button',{name:'切换版本',exact:true})).toBeDisabled();
+});
+
+test('delete all offline devices requires confirmation and preserves online devices',async({page})=>{
+ const s=await fixture(page);s.nodes.push({...node('offline'),last_seen:Date.now()-60000});
+ await page.getByRole('button',{name:'▤ 设备列表'}).click();
+ const button=page.getByRole('button',{name:'删除离线设备',exact:true});await expect(button).toBeEnabled();
+ page.once('dialog',d=>d.dismiss());await button.click();expect(s.deletes).toHaveLength(0);
+ page.once('dialog',d=>d.accept());await button.click();await expect.poll(()=>s.deletes.length).toBe(1);
+ expect(s.nodes).toHaveLength(3);await expect(button).toBeDisabled();
+});
+test('multiple selected devices can detach with permanent deletion confirmation',async({page})=>{
+ const s=await fixture(page);s.inventories={'client-a':[{app_id:'demo',version:'1'}],'client-b':[{app_id:'demo',version:'1'}]};
+ await page.getByRole('button',{name:'▤ 设备列表'}).click();await page.getByLabel('按应用筛选').selectOption('demo');
+ await page.getByRole('button',{name:'全选在线设备'}).click();
+ page.once('dialog',async d=>{expect(d.message()).toContain('永久删除');expect(d.message()).toContain('2 台');await d.accept()});
+ await page.getByRole('button',{name:'批量解除部署',exact:true}).click();await expect.poll(()=>s.requests.length).toBe(1);
+ expect(s.requests[0]).toMatchObject({app_id:'demo',nodes:['client-a','client-b'],request:{action:'detach',confirm:true}});
+ await expect(page.getByText('demo · 批量解除部署')).toBeVisible();
+});
+test('deployment tasks and batches support cancellation and show per-device failures',async({page})=>{
+ const s=await fixture(page);s.operations=[{id:'active',node_id:'client-a',app_id:'demo',action:'deploy',version:'1',stage:'setting_up',result:'',created_at:Date.now()}];
+ s.batches=[{id:'batch',app_id:'demo',nodes:['client-a','client-b'],index:1,failed:1,skipped:0,state:'running',failures:{'client-b':'setup.sh failed: exit 42'}}];
+ await page.getByRole('button',{name:'≡ 操作记录'}).click();await expect(page.getByText('192.0.2.2：setup.sh failed: exit 42')).toBeVisible();
+ page.once('dialog',d=>d.accept());await page.getByRole('button',{name:'取消任务',exact:true}).click();await expect.poll(()=>s.operations[0].cancel_requested).toBe(true);
+ page.once('dialog',d=>d.accept());await page.getByRole('button',{name:'取消批次',exact:true}).click();await expect.poll(()=>s.batches[0].state).toBe('cancelled');
+ await expect(page.getByText('已取消',{exact:true})).toBeVisible();await page.screenshot({path:'test-results/task-controls.png',fullPage:true});
 });

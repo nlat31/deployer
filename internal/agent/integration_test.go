@@ -241,6 +241,41 @@ func TestControllerAgentLifecycle(t *testing.T) {
 	if !completed {
 		t.Fatal("batch timed out")
 	}
+
+	var detach controller.Batch
+	call("POST", "/api/batches", map[string]any{"app_id": "sample", "nodes": []string{client.Identity.NodeID, second.Identity.NodeID}, "request": model.OperationRequest{Action: "detach", Confirm: true}}, 202, &detach)
+	deadline = time.Now().Add(40 * time.Second)
+	detached := false
+	for time.Now().Before(deadline) {
+		var state struct {
+			Batches []controller.Batch `json:"batches"`
+			Apps    []model.App        `json:"apps"`
+		}
+		call("GET", "/api/snapshot", nil, 200, &state)
+		for _, b := range state.Batches {
+			if b.ID == detach.ID && b.State != "running" {
+				if b.State != "succeeded" {
+					t.Fatal("batch detach failed", b)
+				}
+				detached = true
+			}
+		}
+		if detached {
+			if len(state.Apps) != 1 {
+				t.Fatal("detach deleted repository app")
+			}
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !detached {
+		t.Fatal("batch detach timed out")
+	}
+	for _, c := range []*Client{client, second} {
+		if _, err := os.Stat(filepath.Join(c.Root, "apps/sample")); !os.IsNotExist(err) {
+			t.Fatal("batch detach retained app directory", err)
+		}
+	}
 	call("DELETE", "/api/apps/sample?confirm=true", nil, 200, nil)
 	deadline = time.Now().Add(20 * time.Second)
 	for _, c := range []*Client{client, second} {
